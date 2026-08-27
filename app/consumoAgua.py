@@ -24,7 +24,8 @@ class ConsumoAgua:
     hora: int
     ConsumoHora: float
     tag: str = ""
-    categoria: str = ""
+    #! categoria: str = ""
+    motivo: str = ""
     setPointSemana: float = 0.0
     setPointFinSemana: float = 0.0
 
