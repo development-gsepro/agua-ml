@@ -7,9 +7,7 @@ import time
 from psycopg2.extras import execute_values
 
 
-# ============================================================
-# MODELOS
-# ============================================================
+# region CLASES
 
 @dataclass(slots=True)
 class ConsumoAgua:
@@ -89,9 +87,10 @@ class DiaConsumo:
         )
 
 
-# ============================================================
-# CONSTANTES
-# ============================================================
+
+# endregion
+
+# region CONSTANTES
 
 EXCEPCION_MEDIDORES = (
     "AGUA PRINCIPAL",
@@ -109,10 +108,9 @@ DIAS_HISTORICO = 30
 
 BATCH_SIZE_POSTGRES = 5000
 
+# endregion
 
-# ============================================================
-# UTILIDADES
-# ============================================================
+# region UTILIDADES
 
 def normalizar_medidor(medidor: str) -> str:
     return str(
@@ -153,10 +151,9 @@ def clave_consumo(
         consumo.hora,
     )
 
+# endregion
 
-# ============================================================
-# EJECUTAR MSSQL POR DÍA
-# ============================================================
+# region MSSQL
 
 def ejecutar_por_dia(
     fec_ini: str,
@@ -283,11 +280,6 @@ def ejecutar_por_dia(
 
     return resultados
 
-
-# ============================================================
-# SET POINTS - MSSQL
-# ============================================================
-
 def setPointAgua() -> list:
 
     query = """
@@ -351,7 +343,6 @@ def setPointAgua() -> list:
 
     return []
 
-
 # ============================================================
 # SETPOINTS COMO DICCIONARIO
 # ============================================================
@@ -376,7 +367,7 @@ print(
 
 
 # ============================================================
-# CONSUMO POR HORA - MSSQL
+# CONSUMO POR HORA
 # ============================================================
 
 def consumoTotalHora(
@@ -456,10 +447,9 @@ def consumoTotalHora(
 
     return []
 
+# endregion
 
-# ============================================================
-# POSTGRESQL - CONVERTIR ROW
-# ============================================================
+# region POSTGRESQL
 
 def row_a_consumo_db(row) -> ConsumoDB:
 
@@ -484,11 +474,6 @@ def row_a_consumo_db(row) -> ConsumoDB:
         id=row[0],
         consumo=consumo
     )
-
-
-# ============================================================
-# POSTGRESQL - BUSCAR EXISTENTES
-# ============================================================
 
 def obtener_existentes_postgres(
     consumos: list[ConsumoAgua]
@@ -626,7 +611,6 @@ def obtener_existentes_postgres(
     )
 
     return resultado
-
 
 # ============================================================
 # INSERTAR OFFLINE / ATÍPICOS
@@ -1016,10 +1000,10 @@ def obtener_historico_postgres(
 
     return resultado
 
+# endregion
 
-# ============================================================
-# AGRUPAR POR DÍA
-# ============================================================
+
+# region AGRUPAR POR DÍA
 
 def agrupar_por_dia(
     registros: list[ConsumoDB]
@@ -1153,6 +1137,12 @@ class ActualizadorTags:
 
         self.actualizaciones.clear()
 
+
+
+# endregion
+
+
+# region ETIQUETAS
 
 # ============================================================
 # CONSUMO ELEVADO
@@ -1392,9 +1382,12 @@ def evaluar_consumo_madrugada(
             )
 
 
-# ============================================================
-# CLASIFICADOR
-# ============================================================
+
+# endregion
+
+
+# region CLASIFICADOR
+
 
 def clasificador(
     fec_ini: str,
@@ -1976,3 +1969,6 @@ def clasificador(
     print("#" * 70)
 
     return consumos
+
+
+# endregion 
