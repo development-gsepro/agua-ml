@@ -1,19 +1,28 @@
-from .app.consumoAgua import ejecutar_por_dia, consumoTotalHora
+from app.consumoAgua import cargar_setpoints
+import pandas as pd
 
-# '2026-08-01', '2026-08-24'
+setpoint = cargar_setpoints()
 
-fec_ini = ''
-fec_fin = ''
+registros = []
 
-consumos = ejecutar_por_dia(
-        fec_ini,
-        fec_fin,
-        consumoTotalHora
-    ) 
+for clave, valores in setpoint.items():
 
+    id_vbox, medidor = clave
 
-# VISUALIZAR Y ANALIZAR > 0 EN CONSUMO TOTAL | PUNTO FUERA DE LO COMUN CLASIFICARLO COMO ATIPICO POSITIVO
-    # Total -> Dia | 24 "ATIPICO POSITIVO EN CONSUMO TOTAL" -> RANGO DE FECHA (25) 
-        # HORA -> DIA | 24 "ATIPICO POSITIVO EN CONSUMO HORA" -> HORA DEL ATIPICO
+    registros.append({
+        "idVBox": id_vbox,
+        "Medidor": medidor,
+        "weekdaysValue": valores.weekdaysValue,
+        "weekendValue": valores.weekendValue,
+    })
 
-    
+df = pd.DataFrame(registros)
+
+df.to_excel("setpoints.xlsx", index=False)
+
+print()
+print("==========================================")
+print("EXCEL GENERADO")
+print("==========================================")
+print(f"Registros: {len(df)}")
+print("Archivo: setpoints.xlsx")
