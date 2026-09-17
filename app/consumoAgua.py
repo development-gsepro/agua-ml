@@ -23,6 +23,19 @@ EXCEPCION_MEDIDORES = {
     "AGUA FILTRADA",
 }
 
+# Formatos cuyos SETPOINTS vienen en M3 y deben convertirse a litros.
+# Todos los demás formatos ya vienen en litros.
+# NOTA: los consumos (consumoTotal / ConsumoHora) NO se convierten,
+# ya vienen en litros desde MSSQL.
+FORMATOS_M3 = {
+    "BA",
+    "MB",
+    "SAM'S CLUB",
+    "SAMS CLUB",  # por si viene sin apóstrofo
+    "WALMART",
+    "WMEX",
+}
+
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 HORAS_MADRUGADA = set(range(0, 6))
@@ -89,15 +102,16 @@ class DiaConsumo:
 
     @property
     def set_point(self) -> float:
+        """
+        Usa siempre setpoint_agua, que es el valor persistido en
+        PostgreSQL y ya viene en litros (convertido desde M3 si el
+        formato lo requería).
+        """
         if not self.registros:
             return 0.0
 
-        sp = self.registros[0].consumo
-
-        return (
-            float(sp.setPointFinSemana or 0)
-            if self.fecha.weekday() >= 5
-            else float(sp.setPointSemana or 0)
+        return float(
+            self.registros[0].consumo.setpoint_agua or 0
         )
 
     @property
@@ -136,6 +150,17 @@ class DiaConsumo:
 
 def normalizar_medidor(medidor: str) -> str:
     return str(medidor or "").strip().upper()
+
+
+def formato_es_m3(formato) -> bool:
+    """
+    True si el formato corresponde a un medidor cuyo SETPOINT
+    viene en M3 y debe convertirse a litros.
+
+    Los consumos (consumoTotal / ConsumoHora) NO se convierten,
+    ya vienen en litros desde MSSQL.
+    """
+    return str(formato or "").strip().upper() in FORMATOS_M3
 
 
 def fecha_solo(fecha) -> date:
@@ -193,47 +218,14 @@ def valor_numeric_postgres(valor, campo: str):
         )
         return None
 
-    if abs(numero) >= 100_000_000:
+    if abs(numero) >= 100_000_000_000_000_000:
         print(
-            f"[POSTGRES] {campo} fuera de NUMERIC(10,2): "
+            f"[POSTGRES] {campo} fuera de NUMERIC(20,2): "
             f"{numero!r} -> NULL"
         )
         return None
 
     return numero
-
-
-def convertir_m3_a_litros(consumos: list[ConsumoAgua]) -> None:
-    """
-    Si el registro trae 'Formato' (no nulo / no vacío) sus valores
-    vienen en M3 y deben convertirse a litros (x1000).
-
-    Se preservan los sentinelas -1 y -2.
-    """
-
-    convertidos = 0
-
-    for consumo in consumos:
-        formato = consumo.Formato
-
-        if formato is None or not str(formato).strip():
-            continue
-
-        total = float(consumo.consumoTotal or 0)
-
-        if total > 0:
-            consumo.consumoTotal = total * 1000
-
-        hora = float(consumo.ConsumoHora or 0)
-
-        if hora > 0:
-            consumo.ConsumoHora = hora * 1000
-
-        convertidos += 1
-
-    print(
-        f"[CONVERSIÓN] Registros M3 -> litros: {convertidos}"
-    )
 
 
 # ============================================================
@@ -424,6 +416,75 @@ def consumoTotalHora(
                 time.sleep(RETRY_DELAY)
 
     return []
+
+
+# ============================================================
+# APLICAR SETPOINTS
+# ============================================================
+
+def aplicar_setpoints(
+    consumos: list[ConsumoAgua],
+    setpoints: dict
+) -> None:
+    """
+    Aplica los setpoints del SP_ConsultaSetpointAgua a cada consumo.
+
+    - Si el formato del medidor está en FORMATOS_M3, weekdaysValue
+      y weekendValue se convierten de M3 a litros (x1000).
+    - Los demás formatos ya vienen en litros y no se tocan.
+    - setpoint_agua se calcula después de la conversión:
+        * fin de semana -> setPointFinSemana
+        * entre semana  -> setPointSemana
+
+    NOTA: consumoTotal y ConsumoHora NO se convierten, ya vienen
+    en litros desde MSSQL.
+    """
+
+    convertidos = 0
+    asignados = 0
+
+    for consumo in consumos:
+
+        sp = setpoints.get(
+            clave_medidor(
+                consumo.idVBox,
+                consumo.Medidor
+            )
+        )
+
+        if not sp:
+            continue
+
+        weekdays = float(sp.weekdaysValue or 0)
+        weekend = float(sp.weekendValue or 0)
+
+        if formato_es_m3(consumo.Formato):
+
+            if weekdays > 0:
+                weekdays *= 1000
+
+            if weekend > 0:
+                weekend *= 1000
+
+            convertidos += 1
+
+        consumo.setPointSemana = weekdays
+        consumo.setPointFinSemana = weekend
+
+        fecha = fecha_solo(consumo.Fecha)
+
+        consumo.setpoint_agua = (
+            weekend
+            if fecha.weekday() >= 5
+            else weekdays
+        )
+
+        asignados += 1
+
+    print(
+        f"[SETPOINT] Aplicados: {asignados} "
+        f"(convertidos M3 -> L: {convertidos})"
+    )
 
 
 # ============================================================
@@ -1321,43 +1382,20 @@ def clasificador(
     total_recibidos = len(consumos)
 
     # --------------------------------------------------------
-    # CONVERSIÓN M3 -> LITROS
-    # --------------------------------------------------------
-
-    convertir_m3_a_litros(consumos)
-
-    # --------------------------------------------------------
     # APLICAR SETPOINTS
+    #
+    # - Los consumos (consumoTotal / ConsumoHora) NO se
+    #   convierten: ya vienen en litros.
+    # - Solo se convierten los setpoints (weekdaysValue /
+    #   weekendValue) de M3 a litros cuando el formato
+    #   corresponde a un medidor en M3.
     # --------------------------------------------------------
 
-    for consumo in consumos:
+    print(
+        "\n[SETPOINT] Aplicando setpoints..."
+    )
 
-        sp = setpoints.get(
-            clave_medidor(
-                consumo.idVBox,
-                consumo.Medidor
-            )
-        )
-
-        if sp:
-
-            consumo.setPointSemana = float(
-                sp.weekdaysValue or 0
-            )
-
-            consumo.setPointFinSemana = float(
-                sp.weekendValue or 0
-            )
-
-            fecha = fecha_solo(
-                consumo.Fecha
-            )
-
-            consumo.setpoint_agua = (
-                consumo.setPointFinSemana
-                if fecha.weekday() >= 5
-                else consumo.setPointSemana
-            )
+    aplicar_setpoints(consumos, setpoints)
 
     # --------------------------------------------------------
     # 2. CLASIFICACIÓN DIRECTA
