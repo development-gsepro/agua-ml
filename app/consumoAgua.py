@@ -7,20 +7,48 @@ from typing import Optional
 from psycopg2.extras import execute_values
 import time
 import math
+import re
+
+
+# ============================================================
+# NORMALIZACIÓN DE TEXTO
+# ============================================================
+
+def normalizar_medidor(medidor: str) -> str:
+    """
+    Normaliza el nombre de un medidor para usarlo como clave de
+    búsqueda en las distintas fuentes (MSSQL / PostgreSQL).
+
+    - Mayúsculas
+    - Colapsa espacios consecutivos
+    - Quita espacios y puntos al inicio y al final
+
+    De este modo "Consumo de agua gral." y "CONSUMO DE AGUA GRAL"
+    producen la misma clave.
+    """
+    texto = str(medidor or "").strip().upper()
+    texto = re.sub(r"\s+", " ", texto)
+    return texto.strip(" .")
 
 
 # ============================================================
 # CONSTANTES
 # ============================================================
 
+# Los setpoints se indexan con normalizar_medidor() tanto al
+# cargarlos como al buscarlos, por lo que aquí también se
+# normalizan para que el `in` sea consistente.
 EXCEPCION_MEDIDORES = {
-    "AGUA PRINCIPAL",
-    "AGUA PRINCIPAL*",
-    "CONSUMO DE AGUA",
-    "CONSUMO DE AGUA GRAL",
-    "CONSUMO DE AGUA GRAL.",
-    "AGUA POTABLE",
-    "AGUA FILTRADA",
+    normalizar_medidor(x)
+    for x in (
+        "AGUA PRINCIPAL",
+        "AGUA PRINCIPAL*",
+        "CONSUMO DE AGUA",
+        "CONSUMO DE AGUA GRAL",
+        "CONSUMO DE AGUA GRAL.",
+        "AGUA POTABLE",
+        "AGUA FILTRADA",
+    )
 }
 
 # Formatos cuyos SETPOINTS vienen en M3 y deben convertirse a litros.
@@ -42,9 +70,9 @@ HORAS_MADRUGADA = set(range(0, 6))
 DIAS_HISTORICO = 10
 BATCH_SIZE = 10000
 
-# PostgreSQL NUMERIC(10,2):
-# valor máximo permitido = 99,999,999.99
-NUMERIC_10_2_MAX = 99_999_999.99
+# Límite superior de PostgreSQL NUMERIC(20,2):
+# 99,999,999,999,999,999.99
+NUMERIC_20_2_MAX = 99_999_999_999_999_999.99
 
 
 # ============================================================
@@ -148,10 +176,6 @@ class DiaConsumo:
 # UTILIDADES
 # ============================================================
 
-def normalizar_medidor(medidor: str) -> str:
-    return str(medidor or "").strip().upper()
-
-
 def formato_es_m3(formato) -> bool:
     """
     True si el formato corresponde a un medidor cuyo SETPOINT
@@ -191,14 +215,14 @@ def clave_consumo(consumo: ConsumoAgua) -> tuple:
 
 def valor_numeric_postgres(valor, campo: str):
     """
-    Protege los INSERT contra columnas PostgreSQL NUMERIC(10,2).
+    Protege los INSERT contra columnas PostgreSQL NUMERIC(20,2).
 
     Los datos originales permanecen intactos en el objeto ConsumoAgua
     para que las reglas de clasificación sigan trabajando con el valor
     original.
 
     Únicamente se envía NULL a PostgreSQL cuando el valor no puede
-    representarse dentro de NUMERIC(10,2).
+    representarse dentro de NUMERIC(20,2).
     """
 
     if valor is None:
@@ -218,7 +242,7 @@ def valor_numeric_postgres(valor, campo: str):
         )
         return None
 
-    if abs(numero) >= 100_000_000_000_000_000:
+    if abs(numero) > NUMERIC_20_2_MAX:
         print(
             f"[POSTGRES] {campo} fuera de NUMERIC(20,2): "
             f"{numero!r} -> NULL"
@@ -226,6 +250,68 @@ def valor_numeric_postgres(valor, campo: str):
         return None
 
     return numero
+
+
+# ============================================================
+# MAPEO DE COLUMNAS (SP de setpoints)
+# ============================================================
+
+def _normalizar_nombre_columna(nombre) -> str:
+    """
+    Normaliza el nombre de una columna para comparación flexible:
+    sin espacios, sin guiones bajos y en minúsculas.
+
+    "idVBox", "ID_VBOX" y "id VBox" -> "idvbox"
+    """
+    return re.sub(
+        r"[\s_]+",
+        "",
+        str(nombre or "").strip().lower(),
+    )
+
+
+def _indice_columnas(descripcion) -> dict:
+    """
+    Construye un dict {nombre_normalizado: posición} a partir de
+    cursor.description.
+    """
+    return {
+        _normalizar_nombre_columna(col[0]): idx
+        for idx, col in enumerate(descripcion or [])
+    }
+
+
+def _fila_a_setpoint(row, columnas: dict) -> SetPointAgua:
+    """
+    Convierte una fila del SP_ConsultaSetpointAgua en SetPointAgua
+    buscando las columnas por NOMBRE en lugar de por posición.
+
+    `columnas` es el dict producido por _indice_columnas().
+    """
+
+    def buscar(*alias):
+        for a in alias:
+            key = _normalizar_nombre_columna(a)
+            if key in columnas:
+                return row[columnas[key]]
+        raise KeyError(
+            f"No se encontró ninguna columna entre {alias}. "
+            f"Columnas disponibles: {list(columnas.keys())}"
+        )
+
+    return SetPointAgua(
+        idVBox=buscar("idVBox", "id_vbox", "id"),
+        Medidor=buscar("Medidor"),
+        weekdaysValue=buscar(
+            "weekdaysValue", "weekdays_value",
+            "weekdayValue", "weekday_value",
+            "weekdays", "weekday",
+        ),
+        weekendValue=buscar(
+            "weekendValue", "weekend_value",
+            "weekend", "weekends",
+        ),
+    )
 
 
 # ============================================================
@@ -342,20 +428,41 @@ def cargar_setpoints() -> dict:
                         if not cursor.nextset():
                             return {}
 
+                    columnas = _indice_columnas(
+                        cursor.description
+                    )
+
                     rows = cursor.fetchall()
 
-            resultado = {
-                clave_medidor(
-                    row[0],
-                    row[1]
-                ): SetPointAgua(*row)
-                for row in rows
-            }
+            resultado = {}
+            filas_ignoradas = 0
 
-            print(
+            for row in rows:
+                try:
+                    sp = _fila_a_setpoint(row, columnas)
+                except KeyError as e:
+                    filas_ignoradas += 1
+                    if filas_ignoradas <= 5:
+                        print(
+                            f"[SETPOINT] Fila ignorada: {e}"
+                        )
+                    continue
+
+                resultado[
+                    clave_medidor(sp.idVBox, sp.Medidor)
+                ] = sp
+
+            mensaje = (
                 f"[SETPOINT] OK - "
                 f"{len(resultado)} set points indexados"
             )
+
+            if filas_ignoradas:
+                mensaje += (
+                    f" ({filas_ignoradas} filas ignoradas)"
+                )
+
+            print(mensaje)
 
             return resultado
 
@@ -442,17 +549,23 @@ def aplicar_setpoints(
 
     convertidos = 0
     asignados = 0
+    sin_sp = 0
+    medidores_sin_sp: dict[tuple, int] = {}
 
     for consumo in consumos:
 
-        sp = setpoints.get(
-            clave_medidor(
-                consumo.idVBox,
-                consumo.Medidor
-            )
+        clave = clave_medidor(
+            consumo.idVBox,
+            consumo.Medidor
         )
 
+        sp = setpoints.get(clave)
+
         if not sp:
+            sin_sp += 1
+            medidores_sin_sp[clave] = (
+                medidores_sin_sp.get(clave, 0) + 1
+            )
             continue
 
         weekdays = float(sp.weekdaysValue or 0)
@@ -485,6 +598,28 @@ def aplicar_setpoints(
         f"[SETPOINT] Aplicados: {asignados} "
         f"(convertidos M3 -> L: {convertidos})"
     )
+
+    if sin_sp:
+        print(
+            f"[SETPOINT] ADVERTENCIA: {sin_sp} consumos sin "
+            f"set point coincidente ({len(medidores_sin_sp)} "
+            f"medidores únicos)."
+        )
+
+        for (id_vbox, medidor), cantidad in list(
+            medidores_sin_sp.items()
+        )[:20]:
+            print(
+                f"    - idVBox={id_vbox} "
+                f"Medidor={medidor!r} "
+                f"({cantidad} registros)"
+            )
+
+        if len(medidores_sin_sp) > 20:
+            print(
+                f"    ... y {len(medidores_sin_sp) - 20} "
+                f"medidores más."
+            )
 
 
 # ============================================================
