@@ -22,9 +22,6 @@ def normalizar_medidor(medidor: str) -> str:
     - Mayúsculas
     - Colapsa espacios consecutivos
     - Quita espacios y puntos al inicio y al final
-
-    De este modo "Consumo de agua gral." y "CONSUMO DE AGUA GRAL"
-    producen la misma clave.
     """
     texto = str(medidor or "").strip().upper()
     texto = re.sub(r"\s+", " ", texto)
@@ -35,9 +32,6 @@ def normalizar_medidor(medidor: str) -> str:
 # CONSTANTES
 # ============================================================
 
-# Los setpoints se indexan con normalizar_medidor() tanto al
-# cargarlos como al buscarlos, por lo que aquí también se
-# normalizan para que el `in` sea consistente.
 EXCEPCION_MEDIDORES = {
     normalizar_medidor(x)
     for x in (
@@ -53,13 +47,11 @@ EXCEPCION_MEDIDORES = {
 
 # Formatos cuyos SETPOINTS vienen en M3 y deben convertirse a litros.
 # Todos los demás formatos ya vienen en litros.
-# NOTA: los consumos (consumoTotal / ConsumoHora) NO se convierten,
-# ya vienen en litros desde MSSQL.
 FORMATOS_M3 = {
     "BA",
     "MB",
     "SAM'S CLUB",
-    "SAMS CLUB",  # por si viene sin apóstrofo
+    "SAMS CLUB",
     "WALMART",
     "WMEX",
 }
@@ -70,8 +62,9 @@ HORAS_MADRUGADA = set(range(0, 6))
 DIAS_HISTORICO = 10
 BATCH_SIZE = 10000
 
-# Límite superior de PostgreSQL NUMERIC(20,2):
-# 99,999,999,999,999,999.99
+# Límites reales de las columnas NUMERIC de la tabla consumo_agua
+# (ver estructura): M2 -> numeric(10,2), el resto -> numeric(20,2).
+NUMERIC_10_2_MAX = 99_999_999.99
 NUMERIC_20_2_MAX = 99_999_999_999_999_999.99
 
 
@@ -83,7 +76,10 @@ NUMERIC_20_2_MAX = 99_999_999_999_999_999.99
 class ConsumoAgua:
     idVBox: int
     Sucursal: str
-    Medidor: str
+    Cliente: str
+    Area: str
+    NombreMedidor: str
+    Ciudad: str
     Formato: str
     Mercado: str
     Campo: str
@@ -93,6 +89,7 @@ class ConsumoAgua:
     consumoTotal: float
     hora: int
     ConsumoHora: float
+
     tag: str = ""
     categoria: str = ""
     motivo: str = ""
@@ -130,11 +127,6 @@ class DiaConsumo:
 
     @property
     def set_point(self) -> float:
-        """
-        Usa siempre setpoint_agua, que es el valor persistido en
-        PostgreSQL y ya viene en litros (convertido desde M3 si el
-        formato lo requería).
-        """
         if not self.registros:
             return 0.0
 
@@ -177,13 +169,6 @@ class DiaConsumo:
 # ============================================================
 
 def formato_es_m3(formato) -> bool:
-    """
-    True si el formato corresponde a un medidor cuyo SETPOINT
-    viene en M3 y debe convertirse a litros.
-
-    Los consumos (consumoTotal / ConsumoHora) NO se convierten,
-    ya vienen en litros desde MSSQL.
-    """
     return str(formato or "").strip().upper() in FORMATOS_M3
 
 
@@ -207,22 +192,29 @@ def clave_medidor(id_vbox: int, medidor: str) -> tuple:
 def clave_consumo(consumo: ConsumoAgua) -> tuple:
     return (
         consumo.idVBox,
-        normalizar_medidor(consumo.Medidor),
+        normalizar_medidor(consumo.Area),
         fecha_solo(consumo.Fecha),
         consumo.hora,
     )
 
 
-def valor_numeric_postgres(valor, campo: str):
+def valor_numeric_postgres(
+    valor,
+    campo: str,
+    limite_max: float = NUMERIC_20_2_MAX,
+):
     """
-    Protege los INSERT contra columnas PostgreSQL NUMERIC(20,2).
+    Protege los INSERT contra columnas PostgreSQL NUMERIC.
 
-    Los datos originales permanecen intactos en el objeto ConsumoAgua
-    para que las reglas de clasificación sigan trabajando con el valor
-    original.
+    `limite_max` debe coincidir con la definición real de la columna:
+      - M2            -> NUMERIC(10, 2)
+      - consumoTotal  -> NUMERIC(20, 2)
+      - ConsumoHora   -> NUMERIC(20, 2)
+      - setpoint_agua -> NUMERIC(20, 2)
 
-    Únicamente se envía NULL a PostgreSQL cuando el valor no puede
-    representarse dentro de NUMERIC(20,2).
+    Si el valor no puede representarse, se envía NULL a Postgres y se
+    deja intacto el valor original en el objeto ConsumoAgua para que
+    las reglas de clasificación sigan trabajando con él.
     """
 
     if valor is None:
@@ -242,10 +234,10 @@ def valor_numeric_postgres(valor, campo: str):
         )
         return None
 
-    if abs(numero) > NUMERIC_20_2_MAX:
+    if abs(numero) > limite_max:
         print(
-            f"[POSTGRES] {campo} fuera de NUMERIC(20,2): "
-            f"{numero!r} -> NULL"
+            f"[POSTGRES] {campo} fuera de rango "
+            f"(>{limite_max}): {numero!r} -> NULL"
         )
         return None
 
@@ -257,12 +249,6 @@ def valor_numeric_postgres(valor, campo: str):
 # ============================================================
 
 def _normalizar_nombre_columna(nombre) -> str:
-    """
-    Normaliza el nombre de una columna para comparación flexible:
-    sin espacios, sin guiones bajos y en minúsculas.
-
-    "idVBox", "ID_VBOX" y "id VBox" -> "idvbox"
-    """
     return re.sub(
         r"[\s_]+",
         "",
@@ -271,10 +257,6 @@ def _normalizar_nombre_columna(nombre) -> str:
 
 
 def _indice_columnas(descripcion) -> dict:
-    """
-    Construye un dict {nombre_normalizado: posición} a partir de
-    cursor.description.
-    """
     return {
         _normalizar_nombre_columna(col[0]): idx
         for idx, col in enumerate(descripcion or [])
@@ -286,7 +268,9 @@ def _fila_a_setpoint(row, columnas: dict) -> SetPointAgua:
     Convierte una fila del SP_ConsultaSetpointAgua en SetPointAgua
     buscando las columnas por NOMBRE en lugar de por posición.
 
-    `columnas` es el dict producido por _indice_columnas().
+    Se aceptan varios alias, tanto para el nombre del medidor
+    ("Medidor", "NombreMedidor", "Area") como para los valores
+    ("weekdaysValue"/"weekday"/..., "weekendValue"/"weekend"/...).
     """
 
     def buscar(*alias):
@@ -301,7 +285,12 @@ def _fila_a_setpoint(row, columnas: dict) -> SetPointAgua:
 
     return SetPointAgua(
         idVBox=buscar("idVBox", "id_vbox", "id"),
-        Medidor=buscar("Medidor"),
+        Medidor=buscar(
+            "Medidor",
+            "NombreMedidor",
+            "Nombre_Medidor",
+            "Area",
+        ),
         weekdaysValue=buscar(
             "weekdaysValue", "weekdays_value",
             "weekdayValue", "weekday_value",
@@ -324,19 +313,10 @@ def ejecutar_por_dia(
     funcion_dia
 ) -> list[ConsumoAgua]:
 
-    fecha_inicio = datetime.strptime(
-        fec_ini,
-        "%Y-%m-%d"
-    ).date()
+    fecha_inicio = datetime.strptime(fec_ini, "%Y-%m-%d").date()
+    fecha_fin = datetime.strptime(fec_fin, "%Y-%m-%d").date()
 
-    fecha_fin = datetime.strptime(
-        fec_fin,
-        "%Y-%m-%d"
-    ).date()
-
-    total_dias = (
-        fecha_fin - fecha_inicio
-    ).days + 1
+    total_dias = (fecha_fin - fecha_inicio).days + 1
 
     resultados = []
 
@@ -353,9 +333,7 @@ def ejecutar_por_dia(
     while fecha_actual <= fecha_fin:
         dia += 1
 
-        fecha_str = fecha_actual.strftime(
-            "%Y-%m-%d"
-        )
+        fecha_str = fecha_actual.strftime("%Y-%m-%d")
 
         print(
             f"[MSSQL {dia}/{total_dias}] "
@@ -367,21 +345,14 @@ def ejecutar_por_dia(
         for intento in range(1, MAX_RETRIES + 1):
             try:
                 inicio = time.perf_counter()
-
-                resultado_dia = funcion_dia(
-                    fecha_str
-                )
-
-                segundos = (
-                    time.perf_counter() - inicio
-                )
+                resultado_dia = funcion_dia(fecha_str)
+                segundos = time.perf_counter() - inicio
 
                 print(
                     f"[MSSQL {fecha_str}] OK - "
                     f"{len(resultado_dia)} registros "
                     f"({segundos:.2f}s)"
                 )
-
                 break
 
             except Exception as e:
@@ -389,18 +360,13 @@ def ejecutar_por_dia(
                     f"[MSSQL {fecha_str}] ERROR "
                     f"{intento}/{MAX_RETRIES}: {e}"
                 )
-
                 if intento < MAX_RETRIES:
                     time.sleep(RETRY_DELAY)
 
         resultados.extend(resultado_dia)
-
         fecha_actual += timedelta(days=1)
 
-    print(
-        f"\nMSSQL - FIN: {len(resultados)} registros"
-    )
-
+    print(f"\nMSSQL - FIN: {len(resultados)} registros")
     print("=" * 70)
 
     return resultados
@@ -410,28 +376,41 @@ def ejecutar_por_dia(
 # SETPOINTS
 # ============================================================
 
+def _valor_numerico(valor) -> float:
+    """
+    Convierte cualquier valor devuelto por el driver (int, float,
+    decimal.Decimal, str numérico, None, ...) a float.
+
+    SQL Server devuelve las columnas NUMERIC/DECIMAL como
+    decimal.Decimal de Python, NO como int ni float. Si exigimos
+    isinstance(valor, (int, float)) todo queda en 0.
+    """
+    if valor is None or isinstance(valor, bool):
+        return 0.0
+
+    try:
+        return float(valor)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
 def cargar_setpoints() -> dict:
+
     query = "EXEC SP_ConsultaSetpointAgua"
 
-    print(
-        "\n[SETPOINT] Consultando set points..."
-    )
+    print("\n[SETPOINT] Consultando set points...")
 
     for intento in range(1, MAX_RETRIES + 1):
         try:
             with get_connection() as conn:
                 with conn.cursor() as cursor:
-
                     cursor.execute(query)
 
                     while cursor.description is None:
                         if not cursor.nextset():
                             return {}
 
-                    columnas = _indice_columnas(
-                        cursor.description
-                    )
-
+                    columnas = _indice_columnas(cursor.description)
                     rows = cursor.fetchall()
 
             resultado = {}
@@ -443,26 +422,53 @@ def cargar_setpoints() -> dict:
                 except KeyError as e:
                     filas_ignoradas += 1
                     if filas_ignoradas <= 5:
-                        print(
-                            f"[SETPOINT] Fila ignorada: {e}"
-                        )
+                        print(f"[SETPOINT] Fila ignorada: {e}")
                     continue
 
-                resultado[
-                    clave_medidor(sp.idVBox, sp.Medidor)
-                ] = sp
+                clave = clave_medidor(sp.idVBox, sp.Medidor)
+
+                sp.weekdaysValue = _valor_numerico(sp.weekdaysValue)
+                sp.weekendValue = _valor_numerico(sp.weekendValue)
+
+                if clave in resultado:
+                    existente = resultado[clave]
+                    existente.weekdaysValue += sp.weekdaysValue
+                    existente.weekendValue += sp.weekendValue
+                else:
+                    resultado[clave] = sp
 
             mensaje = (
                 f"[SETPOINT] OK - "
                 f"{len(resultado)} set points indexados"
             )
-
             if filas_ignoradas:
-                mensaje += (
-                    f" ({filas_ignoradas} filas ignoradas)"
-                )
-
+                mensaje += f" ({filas_ignoradas} filas ignoradas)"
             print(mensaje)
+
+            # ---- Diagnóstico ----
+            if resultado:
+                con_valor = sum(
+                    1
+                    for sp in resultado.values()
+                    if sp.weekdaysValue > 0 or sp.weekendValue > 0
+                )
+                print(
+                    f"[SETPOINT] Con valor > 0: "
+                    f"{con_valor}/{len(resultado)}"
+                )
+                for clave, sp in list(resultado.items())[:5]:
+                    print(
+                        f"[SETPOINT] Ejemplo: "
+                        f"idVBox={sp.idVBox} "
+                        f"Medidor={sp.Medidor!r} "
+                        f"weekdays={sp.weekdaysValue} "
+                        f"weekend={sp.weekendValue}"
+                    )
+                if con_valor == 0:
+                    print(
+                        "[SETPOINT] ADVERTENCIA: todos los "
+                        "setpoints cargados tienen valor 0."
+                    )
 
             return resultado
 
@@ -471,7 +477,6 @@ def cargar_setpoints() -> dict:
                 f"[SETPOINT] ERROR "
                 f"{intento}/{MAX_RETRIES}: {e}"
             )
-
             if intento < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
 
@@ -482,9 +487,7 @@ def cargar_setpoints() -> dict:
 # CONSUMO MSSQL
 # ============================================================
 
-def consumoTotalHora(
-    fecha
-) -> list[ConsumoAgua]:
+def consumoTotalHora(fecha) -> list[ConsumoAgua]:
 
     query = (
         "EXEC dbo.SP_ReporteConsumoAguaDiario_PowerBI "
@@ -493,14 +496,9 @@ def consumoTotalHora(
 
     for intento in range(1, MAX_RETRIES + 1):
         try:
-
             with get_connection() as conn:
                 with conn.cursor() as cursor:
-
-                    cursor.execute(
-                        query,
-                        (fecha, fecha)
-                    )
+                    cursor.execute(query, (fecha, fecha))
 
                     while cursor.description is None:
                         if not cursor.nextset():
@@ -508,17 +506,13 @@ def consumoTotalHora(
 
                     rows = cursor.fetchall()
 
-            return [
-                ConsumoAgua(*row)
-                for row in rows
-            ]
+            return [ConsumoAgua(*row) for row in rows]
 
         except Exception as e:
             print(
                 f"[MSSQL {fecha}] ERROR "
                 f"{intento}/{MAX_RETRIES}: {e}"
             )
-
             if intento < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
 
@@ -528,6 +522,35 @@ def consumoTotalHora(
 # ============================================================
 # APLICAR SETPOINTS
 # ============================================================
+
+def _buscar_setpoint(
+    setpoints: dict,
+    consumo: ConsumoAgua
+) -> Optional[SetPointAgua]:
+    """
+    Intenta localizar el setpoint de un consumo.
+
+    Primero por (idVBox, normalizar(Area)).
+    Si falla, por (idVBox, normalizar(NombreMedidor)).
+    """
+    sp = setpoints.get(
+        clave_medidor(consumo.idVBox, consumo.Area)
+    )
+    if sp:
+        return sp
+
+    if consumo.NombreMedidor:
+        sp = setpoints.get(
+            clave_medidor(
+                consumo.idVBox,
+                consumo.NombreMedidor,
+            )
+        )
+        if sp:
+            return sp
+
+    return None
+
 
 def aplicar_setpoints(
     consumos: list[ConsumoAgua],
@@ -550,19 +573,18 @@ def aplicar_setpoints(
     convertidos = 0
     asignados = 0
     sin_sp = 0
+    con_sp_positivo = 0
     medidores_sin_sp: dict[tuple, int] = {}
 
     for consumo in consumos:
 
-        clave = clave_medidor(
-            consumo.idVBox,
-            consumo.Medidor
-        )
-
-        sp = setpoints.get(clave)
+        sp = _buscar_setpoint(setpoints, consumo)
 
         if not sp:
             sin_sp += 1
+            clave = clave_medidor(
+                consumo.idVBox, consumo.Area
+            )
             medidores_sin_sp[clave] = (
                 medidores_sin_sp.get(clave, 0) + 1
             )
@@ -572,13 +594,10 @@ def aplicar_setpoints(
         weekend = float(sp.weekendValue or 0)
 
         if formato_es_m3(consumo.Formato):
-
             if weekdays > 0:
                 weekdays *= 1000
-
             if weekend > 0:
                 weekend *= 1000
-
             convertidos += 1
 
         consumo.setPointSemana = weekdays
@@ -592,12 +611,25 @@ def aplicar_setpoints(
             else weekdays
         )
 
+        if consumo.setpoint_agua > 0:
+            con_sp_positivo += 1
+
         asignados += 1
 
     print(
         f"[SETPOINT] Aplicados: {asignados} "
         f"(convertidos M3 -> L: {convertidos})"
     )
+    print(
+        f"[SETPOINT] Con setpoint_agua > 0: "
+        f"{con_sp_positivo}/{asignados}"
+    )
+
+    if asignados > 0 and con_sp_positivo == 0:
+        print(
+            "[SETPOINT] ADVERTENCIA: todos los setpoints "
+            "aplicados quedaron en 0."
+        )
 
     if sin_sp:
         print(
@@ -605,7 +637,6 @@ def aplicar_setpoints(
             f"set point coincidente ({len(medidores_sin_sp)} "
             f"medidores únicos)."
         )
-
         for (id_vbox, medidor), cantidad in list(
             medidores_sin_sp.items()
         )[:20]:
@@ -614,7 +645,6 @@ def aplicar_setpoints(
                 f"Medidor={medidor!r} "
                 f"({cantidad} registros)"
             )
-
         if len(medidores_sin_sp) > 20:
             print(
                 f"    ... y {len(medidores_sin_sp) - 20} "
@@ -627,11 +657,37 @@ def aplicar_setpoints(
 # ============================================================
 
 def row_a_consumo_db(row) -> ConsumoDB:
+    """
+    Mapea una fila del SELECT sobre public.consumo_agua al objeto
+    ConsumoAgua / ConsumoDB.
+
+    Orden esperado (19 columnas, igual al SELECT de
+    obtener_historico_postgres):
+        0  id
+        1  idVBox
+        2  Sucursal
+        3  NombreMedidor
+        4  Formato
+        5  Mercado
+        6  Campo
+        7  tipo
+        8  M2
+        9  Fecha
+        10 consumoTotal
+        11 hora
+        12 ConsumoHora
+        13 tag
+        14 categoria
+        15 setpoint_agua
+        16 Cliente
+        17 Area
+        18 Ciudad
+    """
 
     consumo = ConsumoAgua(
         idVBox=row[1],
         Sucursal=row[2],
-        Medidor=row[3],
+        NombreMedidor=row[3],
         Formato=row[4],
         Mercado=row[5],
         Campo=row[6],
@@ -644,12 +700,12 @@ def row_a_consumo_db(row) -> ConsumoDB:
         tag=row[13] or "",
         categoria=row[14] or "",
         setpoint_agua=row[15] or 0.0,
+        Cliente=row[16] or "",
+        Area=row[17] or "",
+        Ciudad=row[18] or "",
     )
 
-    return ConsumoDB(
-        id=row[0],
-        consumo=consumo
-    )
+    return ConsumoDB(id=row[0], consumo=consumo)
 
 
 # ============================================================
@@ -668,11 +724,12 @@ def insertar_consumos(
         f"{len(consumos)} registros..."
     )
 
+    # Columnas reales de public.consumo_agua (id se auto-genera).
     query = """
         INSERT INTO public.consumo_agua (
             "idVBox",
             "Sucursal",
-            "Medidor",
+            "NombreMedidor",
             "Formato",
             "Mercado",
             "Campo",
@@ -684,68 +741,71 @@ def insertar_consumos(
             "ConsumoHora",
             tag,
             categoria,
-            setpoint_agua
+            setpoint_agua,
+            "Cliente",
+            "Area",
+            "Ciudad"
         )
         VALUES %s
         RETURNING id
     """
 
     resultado = {}
-
     insertados = 0
-
     inicio = time.perf_counter()
 
     with get_conn() as conn:
         with conn.cursor() as cursor:
 
-            for posicion in range(
-                0,
-                len(consumos),
-                BATCH_SIZE
-            ):
+            for posicion in range(0, len(consumos), BATCH_SIZE):
 
-                lote = consumos[
-                    posicion:
-                    posicion + BATCH_SIZE
-                ]
+                lote = consumos[posicion: posicion + BATCH_SIZE]
 
                 valores = [
                     (
                         c.idVBox,
                         c.Sucursal,
-                        c.Medidor,
+                        c.NombreMedidor,
                         c.Formato,
                         c.Mercado,
                         c.Campo,
                         c.tipo,
 
+                        # M2 -> numeric(10,2)
                         valor_numeric_postgres(
-                            c.M2,
-                            "M2"
+                            c.M2, "M2", NUMERIC_10_2_MAX
                         ),
 
                         c.Fecha,
 
+                        # consumoTotal -> numeric(20,2)
                         valor_numeric_postgres(
                             c.consumoTotal,
-                            "consumoTotal"
+                            "consumoTotal",
+                            NUMERIC_20_2_MAX,
                         ),
 
                         c.hora,
 
+                        # ConsumoHora -> numeric(20,2)
                         valor_numeric_postgres(
                             c.ConsumoHora,
-                            "ConsumoHora"
+                            "ConsumoHora",
+                            NUMERIC_20_2_MAX,
                         ),
 
                         c.tag or "",
                         c.categoria or "",
 
+                        # setpoint_agua -> numeric(20,2)
                         valor_numeric_postgres(
                             c.setpoint_agua,
-                            "setpoint_agua"
+                            "setpoint_agua",
+                            NUMERIC_20_2_MAX,
                         ),
+                        c.Cliente,
+                        c.Area,
+                        c.Ciudad,
                     )
                     for c in lote
                 ]
@@ -755,7 +815,7 @@ def insertar_consumos(
                     query,
                     valores,
                     page_size=BATCH_SIZE,
-                    fetch=True
+                    fetch=True,
                 )
 
                 if len(rows) != len(lote):
@@ -765,15 +825,10 @@ def insertar_consumos(
                         f"{len(rows)} IDs"
                     )
 
-                for consumo, row in zip(
-                    lote,
-                    rows
-                ):
-                    resultado[
-                        clave_consumo(consumo)
-                    ] = ConsumoDB(
+                for consumo, row in zip(lote, rows):
+                    resultado[clave_consumo(consumo)] = ConsumoDB(
                         id=row[0],
-                        consumo=consumo
+                        consumo=consumo,
                     )
 
                 insertados += len(lote)
@@ -786,9 +841,7 @@ def insertar_consumos(
 
             conn.commit()
 
-    segundos = (
-        time.perf_counter() - inicio
-    )
+    segundos = time.perf_counter() - inicio
 
     print(
         f"[POSTGRES] Insertados: "
@@ -813,10 +866,11 @@ def obtener_historico_postgres(
 
     valores = list(grupos)
 
-    placeholders = ", ".join(
-        ["(%s,%s)"] * len(valores)
-    )
+    placeholders = ", ".join(["(%s,%s)"] * len(valores))
 
+    # Se compara contra Area y NombreMedidor usando la misma
+    # normalización que normalizar_medidor() en Python:
+    #   UPPER + colapsar espacios + recortar ' ', '.'
     query = f"""
         WITH grupos(id_vbox, medidor) AS (
             VALUES {placeholders}
@@ -825,7 +879,7 @@ def obtener_historico_postgres(
             c.id,
             c."idVBox",
             c."Sucursal",
-            c."Medidor",
+            c."NombreMedidor",
             c."Formato",
             c."Mercado",
             c."Campo",
@@ -837,26 +891,41 @@ def obtener_historico_postgres(
             c."ConsumoHora",
             c.tag,
             c.categoria,
-            c.setpoint_agua
+            c.setpoint_agua,
+            c."Cliente",
+            c."Area",
+            c."Ciudad"
         FROM public.consumo_agua c
         INNER JOIN grupos g
             ON c."idVBox" = g.id_vbox
-            AND UPPER(TRIM(c."Medidor")) = g.medidor
+            AND (
+                regexp_replace(
+                    regexp_replace(
+                        UPPER(TRIM(COALESCE(c."Area", ''))),
+                        '\\s+', ' ', 'g'
+                    ),
+                    '^[ .]+|[ .]+$', '', 'g'
+                ) = g.medidor
+                OR
+                regexp_replace(
+                    regexp_replace(
+                        UPPER(TRIM(COALESCE(c."NombreMedidor", ''))),
+                        '\\s+', ' ', 'g'
+                    ),
+                    '^[ .]+|[ .]+$', '', 'g'
+                ) = g.medidor
+            )
         WHERE c."Fecha" >= %s
           AND c."Fecha" < %s
     """
 
     parametros = []
-
     for id_vbox, medidor in valores:
-        parametros.extend([
-            id_vbox,
-            medidor
-        ])
+        parametros.extend([id_vbox, medidor])
 
     parametros.extend([
         fecha_inicio,
-        fecha_fin + timedelta(days=1)
+        fecha_fin + timedelta(days=1),
     ])
 
     print(
@@ -868,27 +937,16 @@ def obtener_historico_postgres(
 
     with get_conn() as conn:
         with conn.cursor() as cursor:
-
-            cursor.execute(
-                query,
-                parametros
-            )
-
+            cursor.execute(query, parametros)
             rows = cursor.fetchall()
 
     resultado = {}
 
     for row in rows:
-
         registro = row_a_consumo_db(row)
+        resultado[clave_consumo(registro.consumo)] = registro
 
-        resultado[
-            clave_consumo(registro.consumo)
-        ] = registro
-
-    segundos = (
-        time.perf_counter() - inicio
-    )
+    segundos = time.perf_counter() - inicio
 
     print(
         f"[POSTGRES] Histórico: "
@@ -910,26 +968,15 @@ def agrupar_por_dia(
     grupos = {}
 
     for registro in registros:
-
-        fecha = fecha_solo(
-            registro.consumo.Fecha
-        )
+        fecha = fecha_solo(registro.consumo.Fecha)
 
         if fecha not in grupos:
-            grupos[fecha] = DiaConsumo(
-                fecha=fecha,
-                registros=[]
-            )
+            grupos[fecha] = DiaConsumo(fecha=fecha, registros=[])
 
-        grupos[fecha].registros.append(
-            registro
-        )
+        grupos[fecha].registros.append(registro)
 
     for dia in grupos.values():
-
-        dia.registros.sort(
-            key=lambda x: x.consumo.hora
-        )
+        dia.registros.sort(key=lambda x: x.consumo.hora)
 
     return grupos
 
@@ -943,20 +990,12 @@ class ActualizadorTags:
     def __init__(self):
         self.actualizaciones = {}
 
-    def agregar(
-        self,
-        registros: list[ConsumoDB],
-        tag: str
-    ):
+    def agregar(self, registros: list[ConsumoDB], tag: str):
         for registro in registros:
-
             if registro.id is None:
                 continue
 
-            self.actualizaciones[
-                registro.id
-            ] = tag
-
+            self.actualizaciones[registro.id] = tag
             registro.consumo.tag = tag
 
     def cantidad(self) -> int:
@@ -967,9 +1006,7 @@ class ActualizadorTags:
         if not self.actualizaciones:
             return
 
-        valores = list(
-            self.actualizaciones.items()
-        )
+        valores = list(self.actualizaciones.items())
 
         print(
             f"[POSTGRES] Actualizando "
@@ -987,42 +1024,28 @@ class ActualizadorTags:
 
         with get_conn() as conn:
             with conn.cursor() as cursor:
-
-                for posicion in range(
-                    0,
-                    len(valores),
-                    BATCH_SIZE
-                ):
-
-                    lote = valores[
-                        posicion:
-                        posicion + BATCH_SIZE
-                    ]
-
+                for posicion in range(0, len(valores), BATCH_SIZE):
+                    lote = valores[posicion: posicion + BATCH_SIZE]
                     execute_values(
                         cursor,
                         query,
                         lote,
-                        page_size=BATCH_SIZE
+                        page_size=BATCH_SIZE,
                     )
-
             conn.commit()
 
-        segundos = (
-            time.perf_counter() - inicio
-        )
+        segundos = time.perf_counter() - inicio
 
         print(
             f"[POSTGRES] Tags actualizados: "
-            f"{len(valores)} "
-            f"({segundos:.2f}s)"
+            f"{len(valores)} ({segundos:.2f}s)"
         )
 
         self.actualizaciones.clear()
 
 
 # ============================================================
-# CLASIFICADORES DE FUGAS Y CONSUMO ELEVADO
+# CLASIFICADORES
 # ============================================================
 
 def evaluar_consumo_elevado(
@@ -1032,40 +1055,21 @@ def evaluar_consumo_elevado(
 
     fechas = sorted(dias)
 
-    for idx, fecha_actual in enumerate(fechas):
+    for fecha_actual in fechas:
+        inicio = fecha_actual - timedelta(days=6)
 
-        inicio = (
-            fecha_actual -
-            timedelta(days=6)
-        )
-
-        ventana = [
-            dias[f]
-            for f in fechas
-            if inicio <= f <= fecha_actual
-        ]
+        ventana = [dias[f] for f in fechas if inicio <= f <= fecha_actual]
 
         if len(ventana) < 7:
             continue
 
-        if sum(
-            dia.supera_sp
-            for dia in ventana
-        ) > 3:
-
+        if sum(dia.supera_sp for dia in ventana) > 3:
             registros = []
-
             for dia in ventana:
-
                 if dia.supera_sp:
-                    registros.extend(
-                        dia.registros
-                    )
+                    registros.extend(dia.registros)
 
-            actualizador.agregar(
-                registros,
-                "CONSUMO ELEVADO"
-            )
+            actualizador.agregar(registros, "CONSUMO ELEVADO")
 
 
 def evaluar_fugas(
@@ -1074,7 +1078,6 @@ def evaluar_fugas(
 ):
 
     fechas = sorted(dias)
-
     n = len(fechas)
 
     for i in range(n):
@@ -1083,11 +1086,8 @@ def evaluar_fugas(
             break
 
         if not (
-            fechas[i + 1]
-            == fechas[i] + timedelta(days=1)
-            and
-            fechas[i + 2]
-            == fechas[i + 1] + timedelta(days=1)
+            fechas[i + 1] == fechas[i] + timedelta(days=1)
+            and fechas[i + 2] == fechas[i + 1] + timedelta(days=1)
         ):
             continue
 
@@ -1095,11 +1095,7 @@ def evaluar_fugas(
         d2 = dias[fechas[i + 1]]
         d3 = dias[fechas[i + 2]]
 
-        if not (
-            d1.supera_sp
-            and d2.supera_sp
-            and d3.supera_sp
-        ):
+        if not (d1.supera_sp and d2.supera_sp and d3.supera_sp):
             continue
 
         if i < 3:
@@ -1110,38 +1106,23 @@ def evaluar_fugas(
         prev3 = dias[fechas[i - 3]]
 
         if not (
-            fechas[i - 1]
-            == fechas[i] - timedelta(days=1)
-            and
-            fechas[i - 2]
-            == fechas[i] - timedelta(days=2)
-            and
-            fechas[i - 3]
-            == fechas[i] - timedelta(days=3)
+            fechas[i - 1] == fechas[i] - timedelta(days=1)
+            and fechas[i - 2] == fechas[i] - timedelta(days=2)
+            and fechas[i - 3] == fechas[i] - timedelta(days=3)
         ):
             continue
 
-        if (
-            prev1.supera_sp
-            or prev2.supera_sp
-            or prev3.supera_sp
-        ):
+        if prev1.supera_sp or prev2.supera_sp or prev3.supera_sp:
             continue
 
-        if (
-            d1.consumo_24h
-            and d2.consumo_24h
-            and d3.consumo_24h
-        ):
+        if d1.consumo_24h and d2.consumo_24h and d3.consumo_24h:
             tag = "FUGA ACTIVA"
         else:
             tag = "POSIBLE FUGA"
 
         actualizador.agregar(
-            d1.registros
-            + d2.registros
-            + d3.registros,
-            tag
+            d1.registros + d2.registros + d3.registros,
+            tag,
         )
 
 
@@ -1151,56 +1132,33 @@ def evaluar_fuga_reparada(
 ):
 
     fechas = sorted(dias)
-
     n = len(fechas)
 
     for i in range(n - 6):
 
         if not all(
-            fechas[j]
-            == fechas[i] + timedelta(days=j - i)
+            fechas[j] == fechas[i] + timedelta(days=j - i)
             for j in range(i, i + 7)
         ):
             continue
 
-        ventana = [
-            dias[fechas[j]]
-            for j in range(i, i + 7)
-        ]
+        ventana = [dias[fechas[j]] for j in range(i, i + 7)]
 
-        expected = [
-            True
-        ] * 3 + [
-            False
-        ] * 4
+        expected = [True] * 3 + [False] * 4
 
         fallos = 0
-
-        for dia, exp in zip(
-            ventana,
-            expected
-        ):
-
+        for dia, exp in zip(ventana, expected):
             if dia.supera_sp != exp:
-
                 fallos += 1
-
                 if fallos > 1:
                     break
 
         if fallos <= 1:
-
             registros = []
-
             for dia in ventana[3:]:
-                registros.extend(
-                    dia.registros
-                )
+                registros.extend(dia.registros)
 
-            actualizador.agregar(
-                registros,
-                "FUGA REPARADA"
-            )
+            actualizador.agregar(registros, "FUGA REPARADA")
 
 
 def evaluar_consumo_madrugada(
@@ -1215,15 +1173,12 @@ def evaluar_consumo_madrugada(
         if total <= 0 or dia.supera_sp:
             continue
 
-        madrugada = (
-            dia.consumo_madrugada
-        )
+        madrugada = dia.consumo_madrugada
 
         if madrugada / total > 0.05:
-
             actualizador.agregar(
                 dia.registros,
-                "CONSUMO DE MADRUGADA"
+                "CONSUMO DE MADRUGADA",
             )
 
 
@@ -1238,93 +1193,43 @@ def marcar_offline_y_sin_agua(
     actualizador: ActualizadorTags,
     registros_db: dict
 ):
-    """
-    Para cada medidor, revisa el último día del período.
 
-    - Si consumoTotal == -1 o -2 y existe algún día anterior
-      con >0 -> MEDIDOR OFFLINE.
-    - Si consumoTotal == 0 y existe algún día anterior
-      con >0 -> SITIO SIN AGUA.
-    """
-
-    for clave, consumos in (
-        periodo_por_medidor.items()
-    ):
+    for clave, consumos in periodo_por_medidor.items():
 
         fechas_dict = {}
 
         for cons in consumos:
-
-            dia = fecha_solo(
-                cons.Fecha
-            )
-
-            fechas_dict.setdefault(
-                dia,
-                []
-            ).append(cons)
+            dia = fecha_solo(cons.Fecha)
+            fechas_dict.setdefault(dia, []).append(cons)
 
         if ultimo_dia_periodo not in fechas_dict:
             continue
 
-        ultimo_consumo = (
-            fechas_dict[
-                ultimo_dia_periodo
-            ][0]
-        )
-
-        consumo_total = (
-            ultimo_consumo.consumoTotal
-        )
+        ultimo_consumo = fechas_dict[ultimo_dia_periodo][0]
+        consumo_total = ultimo_consumo.consumoTotal
 
         registros_ultimo_dia = []
-
-        for cons in fechas_dict[
-            ultimo_dia_periodo
-        ]:
-
+        for cons in fechas_dict[ultimo_dia_periodo]:
             ck = clave_consumo(cons)
-
             if ck in registros_db:
-
-                registros_ultimo_dia.append(
-                    registros_db[ck]
-                )
+                registros_ultimo_dia.append(registros_db[ck])
 
         if not registros_ultimo_dia:
             continue
 
         hay_consumo_previo = False
 
-        for dia, cons_list in (
-            fechas_dict.items()
-        ):
-
+        for dia, cons_list in fechas_dict.items():
             if dia >= ultimo_dia_periodo:
                 continue
-
-            if any(
-                c.consumoTotal > 0
-                for c in cons_list
-            ):
-
+            if any(c.consumoTotal > 0 for c in cons_list):
                 hay_consumo_previo = True
                 break
 
         if not hay_consumo_previo:
-
-            historico = (
-                historico_por_medidor
-                .get(clave, [])
-            )
-
+            historico = historico_por_medidor.get(clave, [])
             for registro in historico:
-
-                if (
-                    registro.consumo.consumoTotal
-                    > 0
-                ):
-
+                if registro.consumo.consumoTotal > 0:
                     hay_consumo_previo = True
                     break
 
@@ -1332,17 +1237,14 @@ def marcar_offline_y_sin_agua(
             continue
 
         if consumo_total in (-1, -2):
-
             actualizador.agregar(
                 registros_ultimo_dia,
-                "MEDIDOR OFFLINE"
+                "MEDIDOR OFFLINE",
             )
-
         elif consumo_total == 0:
-
             actualizador.agregar(
                 registros_ultimo_dia,
-                "SITIO SIN AGUA"
+                "SITIO SIN AGUA",
             )
 
 
@@ -1364,9 +1266,7 @@ def marcar_sin_categorizar(
 
         consumo.tag = "SIN CATEGORIZAR"
 
-        registro = registros_db.get(
-            clave_consumo(consumo)
-        )
+        registro = registros_db.get(clave_consumo(consumo))
 
         if registro and registro.id:
             ids.append(registro.id)
@@ -1382,17 +1282,11 @@ def marcar_sin_categorizar(
 
     with get_conn() as conn:
         with conn.cursor() as cursor:
-
-            cursor.execute(
-                query,
-                (ids,)
-            )
-
+            cursor.execute(query, (ids,))
         conn.commit()
 
     print(
-        f"[POSTGRES] "
-        f"{len(ids)} registros -> "
+        f"[POSTGRES] {len(ids)} registros -> "
         f"SIN CATEGORIZAR"
     )
 
@@ -1406,64 +1300,31 @@ def verificar_sincronizacion(
     registros_db: dict
 ) -> bool:
 
-    claves_mssql = {
-        clave_consumo(c)
-        for c in consumos_recibidos
-    }
-
-    claves_postgres = set(
-        registros_db.keys()
-    )
+    claves_mssql = {clave_consumo(c) for c in consumos_recibidos}
+    claves_postgres = set(registros_db.keys())
 
     print("\n" + "=" * 70)
     print("VERIFICACIÓN FINAL")
     print("=" * 70)
-
     print(
         "MSSQL recibidos "
-        f"(incluye duplicados): "
-        f"{len(consumos_recibidos)}"
+        f"(incluye duplicados): {len(consumos_recibidos)}"
     )
-
-    print(
-        f"Claves únicas en MSSQL: "
-        f"{len(claves_mssql)}"
-    )
-
-    print(
-        f"PostgreSQL encontrados: "
-        f"{len(claves_postgres)}"
-    )
-
-    print(
-        f"Faltantes: "
-        f"{len(claves_mssql - claves_postgres)}"
-    )
-
-    print(
-        f"Adicionales: "
-        f"{len(claves_postgres - claves_mssql)}"
-    )
+    print(f"Claves únicas en MSSQL: {len(claves_mssql)}")
+    print(f"PostgreSQL encontrados: {len(claves_postgres)}")
+    print(f"Faltantes: {len(claves_mssql - claves_postgres)}")
+    print(f"Adicionales: {len(claves_postgres - claves_mssql)}")
 
     if claves_mssql - claves_postgres:
-
-        print(
-            "\n[ERROR] REGISTROS FALTANTES:"
-        )
-
-        for clave in list(
-            claves_mssql - claves_postgres
-        )[:20]:
-
+        print("\n[ERROR] REGISTROS FALTANTES:")
+        for clave in list(claves_mssql - claves_postgres)[:20]:
             print(f"  {clave}")
-
         return False
 
     print(
         "\n[OK] TODAS LAS CLAVES ÚNICAS "
         "DE MSSQL ESTÁN EN POSTGRESQL."
     )
-
     print("=" * 70)
 
     return True
@@ -1483,9 +1344,7 @@ def clasificador(
     print("\n" + "#" * 70)
     print("CLASIFICADOR DE CONSUMO DE AGUA")
     print("#" * 70)
-    print(
-        f"Periodo: {fec_ini} -> {fec_fin}"
-    )
+    print(f"Periodo: {fec_ini} -> {fec_fin}")
     print("#" * 70)
 
     # --------------------------------------------------------
@@ -1500,156 +1359,85 @@ def clasificador(
 
     print("\n[1/6] DESCARGANDO MSSQL")
 
-    consumos = ejecutar_por_dia(
-        fec_ini,
-        fec_fin,
-        consumoTotalHora
-    )
+    consumos = ejecutar_por_dia(fec_ini, fec_fin, consumoTotalHora)
 
     if not consumos:
-
-        print(
-            "[ERROR] MSSQL no devolvió datos."
-        )
-
+        print("[ERROR] MSSQL no devolvió datos.")
         return []
 
     total_recibidos = len(consumos)
 
     # --------------------------------------------------------
     # APLICAR SETPOINTS
-    #
-    # - Los consumos (consumoTotal / ConsumoHora) NO se
-    #   convierten: ya vienen en litros.
-    # - Solo se convierten los setpoints (weekdaysValue /
-    #   weekendValue) de M3 a litros cuando el formato
-    #   corresponde a un medidor en M3.
     # --------------------------------------------------------
 
-    print(
-        "\n[SETPOINT] Aplicando setpoints..."
-    )
-
+    print("\n[SETPOINT] Aplicando setpoints...")
     aplicar_setpoints(consumos, setpoints)
 
     # --------------------------------------------------------
     # 2. CLASIFICACIÓN DIRECTA
     # --------------------------------------------------------
 
-    print(
-        "\n[2/6] "
-        "CLASIFICANDO ATÍPICO Y OFFLINE"
-    )
+    print("\n[2/6] CLASIFICANDO ATÍPICO Y OFFLINE")
 
     historicos = []
-
     atipicos = 0
     offline = 0
 
     for consumo in consumos:
 
-        total = float(
-            consumo.consumoTotal or 0
-        )
+        total = float(consumo.consumoTotal or 0)
+        medidor = normalizar_medidor(consumo.Area)
 
-        medidor = normalizar_medidor(
-            consumo.Medidor
-        )
-
-        # OFFLINE
         if total in (-1, -2):
-
             consumo.tag = "OFFLINE"
-
-            consumo.categoria = (
-                f"{total}"
-            )
-
+            consumo.categoria = f"{total}"
             offline += 1
 
-        # ATÍPICO
         elif (
-            (
-                total == 0
-                and medidor in EXCEPCION_MEDIDORES
-            )
+            (total == 0 and medidor in EXCEPCION_MEDIDORES)
             or total < -2
         ):
-
             consumo.tag = "ATÍPICO"
-
-            consumo.categoria = (
-                f"{total}"
-            )
-
+            consumo.categoria = f"{total}"
             atipicos += 1
-
-            historicos.append(
-                consumo
-            )
+            historicos.append(consumo)
 
         else:
+            historicos.append(consumo)
 
-            historicos.append(
-                consumo
-            )
-
-    print(
-        f"[2/6] OFFLINE: {offline}"
-    )
-
-    print(
-        f"[2/6] ATÍPICO: {atipicos}"
-    )
-
+    print(f"[2/6] OFFLINE: {offline}")
+    print(f"[2/6] ATÍPICO: {atipicos}")
     print(
         f"[2/6] Históricos "
-        f"(para clasificación): "
-        f"{len(historicos)}"
+        f"(para clasificación): {len(historicos)}"
     )
 
     # --------------------------------------------------------
-    # 3. INSERTAR TODOS LOS CONSUMOS
+    # 3. INSERTAR
     # --------------------------------------------------------
 
-    print(
-        "\n[3/6] INSERTANDO EN POSTGRESQL"
-    )
+    print("\n[3/6] INSERTANDO EN POSTGRESQL")
 
-    registros_db = insertar_consumos(
-        consumos
-    )
+    registros_db = insertar_consumos(consumos)
 
     print(
-        f"[3/6] Registros insertados: "
-        f"{len(registros_db)}"
+        f"[3/6] Registros insertados: {len(registros_db)}"
     )
 
     # --------------------------------------------------------
     # 4. PREPARAR MEDIDORES
     # --------------------------------------------------------
 
-    print(
-        "\n[4/6] PREPARANDO MEDIDORES"
-    )
+    print("\n[4/6] PREPARANDO MEDIDORES")
 
     grupos = {}
 
     for consumo in historicos:
+        clave = clave_medidor(consumo.idVBox, consumo.Area)
+        grupos.setdefault(clave, []).append(consumo)
 
-        clave = clave_medidor(
-            consumo.idVBox,
-            consumo.Medidor
-        )
-
-        grupos.setdefault(
-            clave,
-            []
-        ).append(consumo)
-
-    claves_medidores = set(
-        grupos.keys()
-    )
+    claves_medidores = set(grupos.keys())
 
     print(
         f"[4/6] Medidores a clasificar: "
@@ -1662,125 +1450,67 @@ def clasificador(
         # 5. HISTÓRICO
         # ----------------------------------------------------
 
-        print(
-            "\n[5/6] CARGANDO HISTÓRICO"
-        )
+        print("\n[5/6] CARGANDO HISTÓRICO")
 
-        fecha_inicio = datetime.strptime(
-            fec_ini,
-            "%Y-%m-%d"
-        ).date()
-
-        fecha_fin = datetime.strptime(
-            fec_fin,
-            "%Y-%m-%d"
-        ).date()
+        fecha_inicio = datetime.strptime(fec_ini, "%Y-%m-%d").date()
+        fecha_fin = datetime.strptime(fec_fin, "%Y-%m-%d").date()
 
         historico_inicio = (
-            fecha_inicio
-            - timedelta(days=DIAS_HISTORICO)
+            fecha_inicio - timedelta(days=DIAS_HISTORICO)
         )
 
         historico = obtener_historico_postgres(
             claves_medidores,
             historico_inicio,
-            fecha_fin
+            fecha_fin,
         )
 
         historico_por_medidor = {}
 
         for registro in historico.values():
-
             clave = clave_medidor(
                 registro.consumo.idVBox,
-                registro.consumo.Medidor
+                registro.consumo.Area,
             )
-
-            historico_por_medidor.setdefault(
-                clave,
-                []
-            ).append(registro)
+            historico_por_medidor.setdefault(clave, []).append(
+                registro
+            )
 
         # ----------------------------------------------------
         # 6. CLASIFICACIÓN
         # ----------------------------------------------------
 
-        print(
-            "\n[6/6] EJECUTANDO CLASIFICACIÓN"
-        )
+        print("\n[6/6] EJECUTANDO CLASIFICACIÓN")
 
         actualizador = ActualizadorTags()
 
-        for numero, (
-            clave,
-            consumos_medidor
-        ) in enumerate(
+        for numero, (clave, consumos_medidor) in enumerate(
             grupos.items(),
-            start=1
+            start=1,
         ):
 
             todos = {}
 
-            # Histórico
-            for registro in (
-                historico_por_medidor
-                .get(clave, [])
-            ):
+            for registro in historico_por_medidor.get(clave, []):
+                todos[clave_consumo(registro.consumo)] = registro
 
-                todos[
-                    clave_consumo(
-                        registro.consumo
-                    )
-                ] = registro
-
-            # Período
             for consumo in consumos_medidor:
-
-                clave_hora = clave_consumo(
-                    consumo
-                )
-
-                registro = registros_db.get(
-                    clave_hora
-                )
-
+                clave_hora = clave_consumo(consumo)
+                registro = registros_db.get(clave_hora)
                 if registro:
+                    todos[clave_hora] = registro
 
-                    todos[
-                        clave_hora
-                    ] = registro
+            dias = agrupar_por_dia(list(todos.values()))
 
-            dias = agrupar_por_dia(
-                list(todos.values())
-            )
-
-            # Reglas
-            evaluar_consumo_elevado(
-                dias,
-                actualizador
-            )
-
-            evaluar_fugas(
-                dias,
-                actualizador
-            )
-
-            evaluar_fuga_reparada(
-                dias,
-                actualizador
-            )
-
-            evaluar_consumo_madrugada(
-                dias,
-                actualizador
-            )
+            evaluar_consumo_elevado(dias, actualizador)
+            evaluar_fugas(dias, actualizador)
+            evaluar_fuga_reparada(dias, actualizador)
+            evaluar_consumo_madrugada(dias, actualizador)
 
             if numero % 100 == 0:
-
                 print(
                     f"[CLASIFICADOR] "
-                    f"{numero}/"
-                    f"{len(grupos)} medidores"
+                    f"{numero}/{len(grupos)} medidores"
                 )
 
         # ----------------------------------------------------
@@ -1790,123 +1520,70 @@ def clasificador(
         grupos_todos = {}
 
         for consumo in consumos:
-
-            clave = clave_medidor(
-                consumo.idVBox,
-                consumo.Medidor
-            )
-
-            grupos_todos.setdefault(
-                clave,
-                []
-            ).append(consumo)
+            clave = clave_medidor(consumo.idVBox, consumo.Area)
+            grupos_todos.setdefault(clave, []).append(consumo)
 
         marcar_offline_y_sin_agua(
             grupos_todos,
             historico_por_medidor,
             fecha_fin,
             actualizador,
-            registros_db
+            registros_db,
         )
 
         # ----------------------------------------------------
         # APLICAR TAGS
         # ----------------------------------------------------
 
+        print("\n[POSTGRES] APLICANDO TAGS")
         print(
-            "\n[POSTGRES] APLICANDO TAGS"
-        )
-
-        print(
-            f"[POSTGRES] "
-            f"Registros afectados: "
+            f"[POSTGRES] Registros afectados: "
             f"{actualizador.cantidad()}"
         )
-
         actualizador.ejecutar()
 
     # --------------------------------------------------------
     # SIN CATEGORIZAR
     # --------------------------------------------------------
 
-    print(
-        "\n[POSTGRES] "
-        "MARCANDO SIN CATEGORIZAR"
-    )
-
-    marcar_sin_categorizar(
-        consumos,
-        registros_db
-    )
+    print("\n[POSTGRES] MARCANDO SIN CATEGORIZAR")
+    marcar_sin_categorizar(consumos, registros_db)
 
     # --------------------------------------------------------
     # VERIFICACIÓN FINAL
     # --------------------------------------------------------
 
-    verificar_sincronizacion(
-        consumos,
-        registros_db
-    )
+    verificar_sincronizacion(consumos, registros_db)
 
     # --------------------------------------------------------
     # RESUMEN
     # --------------------------------------------------------
 
-    tiempo_total = (
-        time.perf_counter()
-        - inicio_total
-    )
+    tiempo_total = time.perf_counter() - inicio_total
 
     conteo_tags = {}
 
     for consumo in consumos:
-
-        tag = (
-            consumo.tag
-            or "SIN CATEGORIZAR"
-        )
-
-        conteo_tags[tag] = (
-            conteo_tags.get(tag, 0) + 1
-        )
+        tag = consumo.tag or "SIN CATEGORIZAR"
+        conteo_tags[tag] = conteo_tags.get(tag, 0) + 1
 
     print("\n" + "#" * 70)
     print("CLASIFICACIÓN FINALIZADA")
     print("#" * 70)
 
+    print(f"Total MSSQL recibidos: {total_recibidos}")
     print(
-        f"Total MSSQL recibidos: "
-        f"{total_recibidos}"
-    )
-
-    print(
-        f"Total MSSQL "
-        f"(sin contar duplicados): "
+        f"Total MSSQL (sin contar duplicados): "
         f"{len(consumos)}"
     )
-
-    print(
-        f"PostgreSQL sincronizados: "
-        f"{len(registros_db)}"
-    )
-
+    print(f"PostgreSQL sincronizados: {len(registros_db)}")
     print()
 
-    for tag, cantidad in sorted(
-        conteo_tags.items()
-    ):
-
-        print(
-            f"{tag}: {cantidad}"
-        )
+    for tag, cantidad in sorted(conteo_tags.items()):
+        print(f"{tag}: {cantidad}")
 
     print()
-
-    print(
-        f"Tiempo total: "
-        f"{tiempo_total:.2f} segundos"
-    )
-
+    print(f"Tiempo total: {tiempo_total:.2f} segundos")
     print("#" * 70)
 
     return consumos
