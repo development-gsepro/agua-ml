@@ -528,28 +528,19 @@ def _buscar_setpoint(
     consumo: ConsumoAgua
 ) -> Optional[SetPointAgua]:
     """
-    Intenta localizar el setpoint de un consumo.
+    Localiza el setpoint de un consumo.
 
-    Primero por (idVBox, normalizar(Area)).
-    Si falla, por (idVBox, normalizar(NombreMedidor)).
+    Regla de negocio:
+        ConsumoAgua.idVBox  == SetPointAgua.idVBox
+        ConsumoAgua.Area    == SetPointAgua.Medidor   (normalizados)
+
+    No se usa NombreMedidor como respaldo: si el Area del consumo no
+    coincide exactamente (normalizada) con el Medidor del setpoint,
+    el consumo se queda sin setpoint.
     """
-    sp = setpoints.get(
+    return setpoints.get(
         clave_medidor(consumo.idVBox, consumo.Area)
     )
-    if sp:
-        return sp
-
-    if consumo.NombreMedidor:
-        sp = setpoints.get(
-            clave_medidor(
-                consumo.idVBox,
-                consumo.NombreMedidor,
-            )
-        )
-        if sp:
-            return sp
-
-    return None
 
 
 def aplicar_setpoints(
@@ -558,6 +549,10 @@ def aplicar_setpoints(
 ) -> None:
     """
     Aplica los setpoints del SP_ConsultaSetpointAgua a cada consumo.
+
+    - Match: (ConsumoAgua.idVBox, ConsumoAgua.Area) ==
+             (SetPointAgua.idVBox, SetPointAgua.Medidor)
+      usando normalizar_medidor() en el medidor.
 
     - Si el formato del medidor está en FORMATOS_M3, weekdaysValue
       y weekendValue se convierten de M3 a litros (x1000).

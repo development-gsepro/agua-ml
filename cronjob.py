@@ -1,3 +1,3 @@
 from app.consumoAgua import clasificador
 
-clasificador('2026-08-01', '2026-09-14')
+clasificador('2026-09-16', '2026-09-23')
