@@ -1,20 +1,23 @@
-# Preparación de entorno
-Instalar entorno virtual (si ya esta creado se puede saltar este paso)
+# agua-ml
+
+Clasificador modular de consumo de agua.
+
+La lógica principal se encuentra en `app/consumo_agua/` y la infraestructura compartida en `app/shared/`.
+
+## Ejecución
+
 ```bash
-python3 -m venv venv
+python cronjob.py
 ```
 
-Activar entorno virtual:
+## Pruebas
+
 ```bash
-source venv/bin/activate
+python -m pytest -q
 ```
 
-# Instalar Dependencias
-```bash
-pip install -r requirements.txt
-```
+## Atípicos positivos y cache Parquet
 
-# Guardar Dependencias
-```bash
-pip freeze > requirements.txt
-```
+El proyecto incluye un histórico incremental para evitar repetir consultas MSSQL y un modelo PKL de perfiles robustos para detectar `ATÍPICO POSITIVO` como etapa final.
+
+Consulta `ATIPICOS_POSITIVOS.md` para el flujo, entrenamiento y archivos generados.
