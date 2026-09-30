@@ -23,10 +23,12 @@ REPORT_DIR = DATA_DIR / "reportes_atipicos"
 
 TAG_ATIPICO_POSITIVO = "ATÍPICO POSITIVO"
 TAG_SIN_CATEGORIZAR = "SIN CATEGORIZAR"
-MODEL_VERSION = 2
+MODEL_VERSION = 3
 
-# (valor, fecha_iso, hora, idVBox, sucursal, area)
-ObservacionHistorica = tuple[float, str, int, int, str, str]
+# Diario: (consumo_total, fecha_iso)
+ObservacionDiaria = tuple[float, str]
+# Horario: (consumo_hora, hora)
+ObservacionHoraria = tuple[float, int]
 
 
 def normalizar_grupo(valor: object) -> str:
@@ -34,53 +36,86 @@ def normalizar_grupo(valor: object) -> str:
     return re.sub(r"\s+", " ", texto)
 
 
+def _clave_base(id_vbox: object, sucursal: object, area: object) -> tuple[int, str, str]:
+    return (
+        int(id_vbox),
+        normalizar_grupo(sucursal),
+        normalizar_grupo(area),
+    )
+
+
+def _fecha_iso(valor: object) -> str:
+    return pd.Timestamp(valor).normalize().date().isoformat()
+
+
 @dataclass(slots=True)
-class PerfilAtipicoPositivo:
-    ciudad: str
-    cliente: str
+class PerfilDiario:
+    id_vbox: int
+    sucursal: str
+    area: str
     n: int
     mediana: float
     mad: float
     q1: float
     q3: float
     limite_superior: float
-    valores_ordenados: tuple[float, ...]
-    observaciones_ordenadas: tuple[ObservacionHistorica, ...]
+    observaciones: tuple[ObservacionDiaria, ...]
+
+
+@dataclass(slots=True)
+class PerfilHorario:
+    id_vbox: int
+    sucursal: str
+    area: str
+    fecha: str
+    n: int
+    mediana: float
+    mad: float
+    q1: float
+    q3: float
+    limite_superior: float
+    observaciones: tuple[ObservacionHoraria, ...]
 
 
 @dataclass(slots=True)
 class ResultadoAtipicoPositivo:
     consumo: ConsumoAgua
     es_atipico: bool
-    limite: float | None
-    valor: float
-    n_historico: int
-    perfil_usado: str | None
-    ciudad: str = ""
-    cliente: str = ""
-    posicion: int | None = None
-    total_posiciones: int = 0
-    percentil: float | None = None
-    mediana: float | None = None
-    q1: float | None = None
-    q3: float | None = None
+    atipico_diario: bool
+    atipico_horario: bool
+    valor_diario: float
+    valor_horario: float
+    limite_diario: float | None
+    limite_horario: float | None
+    n_diario: int
+    n_horario: int
+    posicion_diaria: int | None = None
+    total_posiciones_diarias: int = 0
+    percentil_diario: float | None = None
+    posicion_horaria: int | None = None
+    total_posiciones_horarias: int = 0
+    percentil_horario: float | None = None
+
+    @property
+    def tiene_perfil(self) -> bool:
+        return self.limite_diario is not None or self.limite_horario is not None
 
 
 class ModeloAtipicosPositivos:
-    """Modelo robusto agrupado EXCLUSIVAMENTE por Ciudad + Cliente.
+    """Modelo de atípicos positivos por medidor.
 
-    Cada perfil conserva los consumos históricos ordenados y su procedencia
-    para poder explicar:
-      1) respecto a qué datos se comparó un consumo;
-      2) qué posición ocupa dentro de esos datos.
+    Mantiene dos mapas independientes:
+      1) Diario: idVBox + Sucursal + Area -> consumoTotal por fecha.
+      2) Horario: idVBox + Sucursal + Area + Fecha -> ConsumoHora por hora.
 
-    El modelo se aplica únicamente al final del flujo, sobre registros que
-    quedaron sin clasificación principal.
+    ``tipo`` / tipo de día no participa en la IA. Ese dato permanece fuera del
+    modelo y puede seguir utilizándose para seleccionar el SetPoint correcto.
     """
 
     def __init__(self, min_muestras: int = 7):
         self.min_muestras = int(min_muestras)
-        self.perfiles: dict[tuple[str, str], PerfilAtipicoPositivo] = {}
+        self.perfiles_diarios: dict[tuple[int, str, str], PerfilDiario] = {}
+        self.perfiles_horarios: dict[tuple[int, str, str, str], PerfilHorario] = {}
         self.entrenado_en: str | None = None
         self.version = MODEL_VERSION
 
@@ -101,241 +136,237 @@ class ModeloAtipicosPositivos:
     @staticmethod
     def _normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
         requerido = {
-            "Ciudad", "Cliente", "ConsumoHora", "Fecha",
-            "hora", "idVBox", "Sucursal", "Area",
+            "idVBox", "Sucursal", "Area", "Fecha",
+            "consumoTotal", "hora", "ConsumoHora",
         }
         faltantes = requerido - set(df.columns)
         if faltantes:
             raise ValueError(
-                "Faltan columnas para entrenar atípicos positivos por "
-                "Ciudad + Cliente: " + ", ".join(sorted(faltantes))
+                "Faltan columnas para entrenar atípicos positivos: "
+                + ", ".join(sorted(faltantes))
             )
 
         trabajo = df.copy()
         trabajo["Fecha"] = pd.to_datetime(trabajo["Fecha"], errors="coerce")
+        trabajo["idVBox"] = pd.to_numeric(trabajo["idVBox"], errors="coerce")
+        trabajo["consumoTotal"] = pd.to_numeric(
+            trabajo["consumoTotal"], errors="coerce"
+        )
+        trabajo["hora"] = pd.to_numeric(trabajo["hora"], errors="coerce")
         trabajo["ConsumoHora"] = pd.to_numeric(
             trabajo["ConsumoHora"], errors="coerce"
         )
-        trabajo["hora"] = pd.to_numeric(trabajo["hora"], errors="coerce")
-        trabajo["idVBox"] = pd.to_numeric(trabajo["idVBox"], errors="coerce")
+        trabajo = trabajo.dropna(subset=["Fecha", "idVBox", "hora"])
 
-        trabajo = trabajo.dropna(
-            subset=["Fecha", "hora", "idVBox", "ConsumoHora"]
-        )
-        trabajo = trabajo[trabajo["ConsumoHora"] > 0]
-
-        if "tag" in trabajo.columns:
-            tags = (
-                trabajo["tag"].fillna("").astype(str).str.strip().str.upper()
-            )
-            trabajo = trabajo[tags.isin(["", TAG_SIN_CATEGORIZAR])]
-
-        if "categoria" in trabajo.columns:
-            categorias = (
-                trabajo["categoria"].fillna("").astype(str).str.strip()
-            )
-            trabajo = trabajo[categorias.eq("")]
-
-        trabajo["ciudad_norm"] = trabajo["Ciudad"].map(normalizar_grupo)
-        trabajo["cliente_norm"] = trabajo["Cliente"].map(normalizar_grupo)
+        trabajo["sucursal_norm"] = trabajo["Sucursal"].map(normalizar_grupo)
+        trabajo["area_norm"] = trabajo["Area"].map(normalizar_grupo)
         trabajo = trabajo[
-            trabajo["ciudad_norm"].ne("")
-            & trabajo["cliente_norm"].ne("")
-        ]
+            trabajo["sucursal_norm"].ne("") & trabajo["area_norm"].ne("")
+        ].copy()
 
-        trabajo["hora"] = trabajo["hora"].astype(int)
         trabajo["idVBox"] = trabajo["idVBox"].astype(int)
+        trabajo["hora"] = trabajo["hora"].astype(int)
+        trabajo["fecha_dia"] = trabajo["Fecha"].dt.normalize()
         return trabajo
 
     @classmethod
-    def _crear_perfil(
+    def _perfil_diario(
         cls,
-        ciudad: str,
-        cliente: str,
+        clave: tuple[int, str, str],
         grupo: pd.DataFrame,
-    ) -> PerfilAtipicoPositivo:
-        ordenado = grupo.sort_values(
-            ["ConsumoHora", "Fecha", "hora", "idVBox"],
-            kind="stable",
+    ) -> PerfilDiario:
+        # consumoTotal se repite en las filas horarias del mismo día. El mapa
+        # diario necesita una sola observación por fecha.
+        por_fecha = (
+            grupo.sort_values(["fecha_dia", "hora"], kind="stable")
+            .drop_duplicates(subset=["fecha_dia"], keep="first")
         )
-        valores = ordenado["ConsumoHora"].to_numpy(dtype=float)
+        por_fecha = por_fecha[
+            np.isfinite(por_fecha["consumoTotal"]) & (por_fecha["consumoTotal"] > 0)
+        ]
+        valores = por_fecha["consumoTotal"].to_numpy(dtype=float)
         mediana, mad, q1, q3, limite = cls._estadisticas(valores)
+        obs = tuple(
+            (float(f.consumoTotal), _fecha_iso(f.fecha_dia))
+            for f in por_fecha.itertuples(index=False)
+        )
+        return PerfilDiario(
+            id_vbox=clave[0], sucursal=clave[1], area=clave[2],
+            n=len(valores), mediana=mediana, mad=mad, q1=q1, q3=q3,
+            limite_superior=limite, observaciones=obs,
+        )
 
-        observaciones: list[ObservacionHistorica] = []
-        for fila in ordenado.itertuples(index=False):
-            fecha = pd.Timestamp(fila.Fecha).isoformat()
-            observaciones.append(
-                (
-                    float(fila.ConsumoHora),
-                    fecha,
-                    int(fila.hora),
-                    int(fila.idVBox),
-                    str(fila.Sucursal or ""),
-                    str(fila.Area or ""),
-                )
-            )
-
-        return PerfilAtipicoPositivo(
-            ciudad=ciudad,
-            cliente=cliente,
-            n=len(valores),
-            mediana=mediana,
-            mad=mad,
-            q1=q1,
-            q3=q3,
-            limite_superior=limite,
-            valores_ordenados=tuple(float(v) for v in valores),
-            observaciones_ordenadas=tuple(observaciones),
+    @classmethod
+    def _perfil_horario(
+        cls,
+        clave: tuple[int, str, str, str],
+        grupo: pd.DataFrame,
+    ) -> PerfilHorario:
+        # Un punto por hora para el mapa del día. Si MSSQL trae una fila
+        # duplicada para la misma hora, no la contamos dos veces.
+        por_hora = (
+            grupo.sort_values(["hora"], kind="stable")
+            .drop_duplicates(subset=["hora"], keep="first")
+        )
+        por_hora = por_hora[
+            np.isfinite(por_hora["ConsumoHora"]) & (por_hora["ConsumoHora"] > 0)
+        ]
+        valores = por_hora["ConsumoHora"].to_numpy(dtype=float)
+        mediana, mad, q1, q3, limite = cls._estadisticas(valores)
+        obs = tuple(
+            (float(f.ConsumoHora), int(f.hora))
+            for f in por_hora.itertuples(index=False)
+        )
+        return PerfilHorario(
+            id_vbox=clave[0], sucursal=clave[1], area=clave[2], fecha=clave[3],
+            n=len(valores), mediana=mediana, mad=mad, q1=q1, q3=q3,
+            limite_superior=limite, observaciones=obs,
         )
 
     def entrenar(self, df: pd.DataFrame) -> "ModeloAtipicosPositivos":
         trabajo = self._normalizar_df(df)
-        perfiles: dict[tuple[str, str], PerfilAtipicoPositivo] = {}
 
-        # Regla solicitada: el mapeo se construye por Ciudad + Cliente.
-        for (ciudad, cliente), grupo in trabajo.groupby(
-            ["ciudad_norm", "cliente_norm"],
-            dropna=False,
-            sort=True,
+        diarios: dict[tuple[int, str, str], PerfilDiario] = {}
+        for raw_clave, grupo in trabajo.groupby(
+            ["idVBox", "sucursal_norm", "area_norm"], sort=True, dropna=False
         ):
-            if len(grupo) < self.min_muestras:
-                continue
-            perfiles[(ciudad, cliente)] = self._crear_perfil(
-                ciudad,
-                cliente,
-                grupo,
+            clave = (int(raw_clave[0]), str(raw_clave[1]), str(raw_clave[2]))
+            validos = (
+                grupo.sort_values(["fecha_dia", "hora"], kind="stable")
+                .drop_duplicates(subset=["fecha_dia"], keep="first")
             )
+            validos = validos[
+                np.isfinite(validos["consumoTotal"]) & (validos["consumoTotal"] > 0)
+            ]
+            if len(validos) >= self.min_muestras:
+                diarios[clave] = self._perfil_diario(clave, grupo)
 
-        self.perfiles = perfiles
+        horarios: dict[tuple[int, str, str, str], PerfilHorario] = {}
+        for raw_clave, grupo in trabajo.groupby(
+            ["idVBox", "sucursal_norm", "area_norm", "fecha_dia"],
+            sort=True,
+            dropna=False,
+        ):
+            clave = (
+                int(raw_clave[0]), str(raw_clave[1]), str(raw_clave[2]),
+                _fecha_iso(raw_clave[3]),
+            )
+            validos = (
+                grupo.sort_values(["hora"], kind="stable")
+                .drop_duplicates(subset=["hora"], keep="first")
+            )
+            validos = validos[
+                np.isfinite(validos["ConsumoHora"]) & (validos["ConsumoHora"] > 0)
+            ]
+            if len(validos) >= self.min_muestras:
+                horarios[clave] = self._perfil_horario(clave, grupo)
+
+        self.perfiles_diarios = diarios
+        self.perfiles_horarios = horarios
         self.entrenado_en = datetime.now().isoformat(timespec="seconds")
         return self
 
-    def _buscar_perfil(
-        self,
-        consumo: ConsumoAgua,
-    ) -> PerfilAtipicoPositivo | None:
-        ciudad = normalizar_grupo(consumo.Ciudad)
-        cliente = normalizar_grupo(consumo.Cliente)
-        if not ciudad or not cliente:
-            return None
-        return self.perfiles.get((ciudad, cliente))
+    def _buscar_diario(self, consumo: ConsumoAgua) -> PerfilDiario | None:
+        return self.perfiles_diarios.get(
+            _clave_base(consumo.idVBox, consumo.Sucursal, consumo.Area)
+        )
 
-    @staticmethod
-    def _misma_observacion(
-        obs: ObservacionHistorica,
-        consumo: ConsumoAgua,
-        valor: float,
-    ) -> bool:
-        """Identifica la misma fila para evitar compararla contra sí misma."""
-        obs_valor, obs_fecha, obs_hora, obs_id, obs_sucursal, obs_area = obs
+    def _buscar_horario(self, consumo: ConsumoAgua) -> PerfilHorario | None:
+        base = _clave_base(consumo.idVBox, consumo.Sucursal, consumo.Area)
+        return self.perfiles_horarios.get((*base, _fecha_iso(consumo.Fecha)))
+
+    def _evaluar_diario(
+        self, consumo: ConsumoAgua
+    ) -> tuple[bool, float | None, int, int | None, int, float | None]:
         try:
-            fecha_consumo = pd.Timestamp(consumo.Fecha).isoformat()
-        except Exception:
-            fecha_consumo = str(consumo.Fecha)
+            valor = float(consumo.consumoTotal)
+        except (TypeError, ValueError, OverflowError):
+            return False, None, 0, None, 0, None
+        if not np.isfinite(valor) or valor <= 0:
+            return False, None, 0, None, 0, None
 
-        return (
-            int(obs_id) == int(consumo.idVBox)
-            and int(obs_hora) == int(consumo.hora)
-            and str(obs_fecha) == fecha_consumo
-            and normalizar_grupo(obs_sucursal)
-            == normalizar_grupo(consumo.Sucursal)
-            and normalizar_grupo(obs_area)
-            == normalizar_grupo(consumo.Area)
-            and bool(np.isclose(float(obs_valor), valor))
-        )
+        perfil = self._buscar_diario(consumo)
+        if perfil is None:
+            return False, None, 0, None, 0, None
 
-    def _referencia_sin_actual(
-        self,
-        perfil: PerfilAtipicoPositivo,
-        consumo: ConsumoAgua,
-        valor: float,
-    ) -> np.ndarray:
-        """Devuelve el grupo Ciudad + Cliente excluyendo una copia del actual.
+        fecha_actual = _fecha_iso(consumo.Fecha)
+        referencia = [v for v, fecha in perfil.observaciones if fecha != fecha_actual]
+        referencia = np.asarray(referencia, dtype=float)
+        referencia = referencia[np.isfinite(referencia)]
+        referencia.sort()
+        if len(referencia) < self.min_muestras:
+            return False, None, len(referencia), None, 0, None
 
-        Si el registro evaluado no está en el histórico (por ejemplo, un dato
-        futuro), se conserva todo el perfil.
-        """
-        observaciones = list(perfil.observaciones_ordenadas)
-        indice_actual = None
+        _med, _mad, _q1, _q3, limite = self._estadisticas(referencia)
+        posicion = int(np.searchsorted(referencia, valor, side="right")) + 1
+        total = len(referencia) + 1
+        percentil = 100.0 * posicion / total
+        return bool(valor > limite), limite, len(referencia), posicion, total, percentil
 
-        for i, obs in enumerate(observaciones):
-            if self._misma_observacion(obs, consumo, valor):
-                indice_actual = i
-                break
-
-        if indice_actual is not None:
-            observaciones.pop(indice_actual)
-
-        return np.asarray(
-            [float(obs[0]) for obs in observaciones],
-            dtype=float,
-        )
-
-    def evaluar(self, consumo: ConsumoAgua) -> ResultadoAtipicoPositivo:
+    def _evaluar_horario(
+        self, consumo: ConsumoAgua
+    ) -> tuple[bool, float | None, int, int | None, int, float | None]:
         try:
             valor = float(consumo.ConsumoHora)
         except (TypeError, ValueError, OverflowError):
-            valor = 0.0
-
-        ciudad = normalizar_grupo(consumo.Ciudad)
-        cliente = normalizar_grupo(consumo.Cliente)
-
+            return False, None, 0, None, 0, None
         if not np.isfinite(valor) or valor <= 0:
-            return ResultadoAtipicoPositivo(
-                consumo, False, None, valor, 0, None,
-                ciudad=ciudad, cliente=cliente,
-            )
+            return False, None, 0, None, 0, None
 
-        perfil = self._buscar_perfil(consumo)
+        perfil = self._buscar_horario(consumo)
         if perfil is None:
-            return ResultadoAtipicoPositivo(
-                consumo, False, None, valor, 0, None,
-                ciudad=ciudad, cliente=cliente,
-            )
+            return False, None, 0, None, 0, None
 
-        # Para una evaluación auditable, el registro actual no puede formar
-        # parte del conjunto contra el que se compara.
-        referencia = self._referencia_sin_actual(
-            perfil,
-            consumo,
-            valor,
-        )
+        # Para evaluar una hora no la comparamos contra sí misma: usamos las
+        # otras horas del mismo idVBox + Sucursal + Area + Fecha.
+        referencia = [
+            v for v, hora in perfil.observaciones if int(hora) != int(consumo.hora)
+        ]
+        referencia = np.asarray(referencia, dtype=float)
         referencia = referencia[np.isfinite(referencia)]
-
+        referencia.sort()
         if len(referencia) < self.min_muestras:
-            return ResultadoAtipicoPositivo(
-                consumo, False, None, valor, len(referencia), None,
-                ciudad=perfil.ciudad,
-                cliente=perfil.cliente,
-            )
+            return False, None, len(referencia), None, 0, None
 
-        mediana, _mad, q1, q3, limite = self._estadisticas(referencia)
+        _med, _mad, _q1, _q3, limite = self._estadisticas(referencia)
+        posicion = int(np.searchsorted(referencia, valor, side="right")) + 1
+        total = len(referencia) + 1
+        percentil = 100.0 * posicion / total
+        return bool(valor > limite), limite, len(referencia), posicion, total, percentil
 
-        # Posición del dato evaluado si se insertara en la referencia ordenada.
-        # El total incluye N datos de referencia + el dato actual.
-        posicion = int(
-            np.searchsorted(referencia, valor, side="right")
-        ) + 1
-        total_posiciones = len(referencia) + 1
-        percentil = 100.0 * posicion / total_posiciones
+    def evaluar(self, consumo: ConsumoAgua) -> ResultadoAtipicoPositivo:
+        try:
+            valor_diario = float(consumo.consumoTotal or 0)
+        except (TypeError, ValueError, OverflowError):
+            valor_diario = 0.0
+        try:
+            valor_horario = float(consumo.ConsumoHora or 0)
+        except (TypeError, ValueError, OverflowError):
+            valor_horario = 0.0
 
-        es_atipico = valor > limite
+        diario = self._evaluar_diario(consumo)
+        horario = self._evaluar_horario(consumo)
+
+        atipico_diario, limite_d, n_d, pos_d, total_d, pct_d = diario
+        atipico_horario, limite_h, n_h, pos_h, total_h, pct_h = horario
 
         return ResultadoAtipicoPositivo(
             consumo=consumo,
-            es_atipico=bool(es_atipico),
-            limite=limite,
-            valor=valor,
-            n_historico=len(referencia),
-            perfil_usado="CIUDAD_CLIENTE",
-            ciudad=perfil.ciudad,
-            cliente=perfil.cliente,
-            posicion=posicion,
-            total_posiciones=total_posiciones,
-            percentil=percentil,
-            mediana=mediana,
-            q1=q1,
-            q3=q3,
+            es_atipico=bool(atipico_diario or atipico_horario),
+            atipico_diario=bool(atipico_diario),
+            atipico_horario=bool(atipico_horario),
+            valor_diario=valor_diario,
+            valor_horario=valor_horario,
+            limite_diario=limite_d,
+            limite_horario=limite_h,
+            n_diario=n_d,
+            n_horario=n_h,
+            posicion_diaria=pos_d,
+            total_posiciones_diarias=total_d,
+            percentil_diario=pct_d,
+            posicion_horaria=pos_h,
+            total_posiciones_horarias=total_h,
+            percentil_horario=pct_h,
         )
 
     def guardar(self, ruta: Path = MODEL_PATH) -> None:
@@ -347,20 +378,25 @@ class ModeloAtipicosPositivos:
     def cargar(cls, ruta: Path = MODEL_PATH) -> "ModeloAtipicosPositivos":
         with ruta.open("rb") as archivo:
             modelo = pickle.load(archivo)
-
         if not isinstance(modelo, cls):
-            raise TypeError(
-                "El PKL no contiene un ModeloAtipicosPositivos válido"
-            )
-
+            raise TypeError("El PKL no contiene un ModeloAtipicosPositivos válido")
         if getattr(modelo, "version", None) != MODEL_VERSION:
             raise ValueError(
                 "El PKL corresponde a una versión anterior del modelo. "
-                "Elimina data/models/atipico_positivo.pkl y vuelve a ejecutar "
-                "python train_atipicos_positivos.py"
+                "El cronjob lo reemplaza automáticamente durante el entrenamiento."
             )
-
         return modelo
+
+
+def entrenar_y_guardar_modelo(
+    df: pd.DataFrame,
+    min_muestras: int = 7,
+    ruta: Path = MODEL_PATH,
+) -> ModeloAtipicosPositivos:
+    """Entrena y guarda el PKL. Es la misma función usada por cronjob y CLI."""
+    modelo = ModeloAtipicosPositivos(min_muestras=min_muestras).entrenar(df)
+    modelo.guardar(ruta)
+    return modelo
 
 
 def es_candidato(consumo: ConsumoAgua) -> bool:
@@ -369,239 +405,74 @@ def es_candidato(consumo: ConsumoAgua) -> bool:
     return tag in {"", TAG_SIN_CATEGORIZAR} and categoria == ""
 
 
-def _nombre_archivo(texto: str) -> str:
-    limpio = re.sub(r"[^A-Z0-9]+", "_", normalizar_grupo(texto))
-    return limpio.strip("_")[:80] or "SIN_DATO"
-
-
 def generar_evidencia_atipicos_positivos(
     resultados: list[ResultadoAtipicoPositivo],
     modelo: ModeloAtipicosPositivos,
-    max_graficas: int = 12,
 ) -> None:
-    """Genera evidencia auditable del mapeo Ciudad + Cliente.
-
-    Archivos:
-      - detalle_atipicos_positivos.csv
-      - resumen_ciudad_cliente.csv
-      - mapeo_historico_ciudad_cliente.csv
-      - reporte_funcionamiento.pdf
-      - graficas/*.png
-    """
+    """Genera mapas CSV auditables, sin crear docenas de gráficas automáticas."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    graficas_dir = REPORT_DIR / "graficas"
-    graficas_dir.mkdir(parents=True, exist_ok=True)
 
     positivos = [r for r in resultados if r.es_atipico]
 
-    # 1) Detalle de cada atípico positivo.
     detalle_path = REPORT_DIR / "detalle_atipicos_positivos.csv"
-    columnas_detalle = [
-        "Ciudad", "Cliente", "idVBox", "Sucursal", "Area",
-        "Fecha", "hora", "ConsumoHora", "n_referencia",
-        "posicion", "total_posiciones", "percentil",
-        "mediana", "q1", "q3", "limite_superior", "exceso",
+    columnas = [
+        "idVBox", "Sucursal", "Area", "Fecha", "hora",
+        "consumo_total", "consumo_hora",
+        "atipico_diario", "atipico_horario",
+        "limite_diario", "limite_horario",
+        "n_referencia_diaria", "n_referencia_horaria",
+        "posicion_diaria", "total_posiciones_diarias", "percentil_diario",
+        "posicion_horaria", "total_posiciones_horarias", "percentil_horario",
     ]
     with detalle_path.open("w", newline="", encoding="utf-8-sig") as archivo:
-        writer = csv.DictWriter(archivo, fieldnames=columnas_detalle)
+        writer = csv.DictWriter(archivo, fieldnames=columnas)
         writer.writeheader()
         for r in positivos:
             c = r.consumo
-            writer.writerow(
-                {
-                    "Ciudad": r.ciudad,
-                    "Cliente": r.cliente,
-                    "idVBox": c.idVBox,
-                    "Sucursal": c.Sucursal,
-                    "Area": c.Area,
-                    "Fecha": str(c.Fecha),
-                    "hora": c.hora,
-                    "ConsumoHora": r.valor,
-                    "n_referencia": r.n_historico,
-                    "posicion": r.posicion,
-                    "total_posiciones": r.total_posiciones,
-                    "percentil": round(r.percentil or 0.0, 4),
-                    "mediana": r.mediana,
-                    "q1": r.q1,
-                    "q3": r.q3,
-                    "limite_superior": r.limite,
-                    "exceso": (
-                        r.valor - r.limite
-                        if r.limite is not None
-                        else None
-                    ),
-                }
-            )
+            writer.writerow({
+                "idVBox": c.idVBox,
+                "Sucursal": c.Sucursal,
+                "Area": c.Area,
+                "Fecha": _fecha_iso(c.Fecha),
+                "hora": c.hora,
+                "consumo_total": r.valor_diario,
+                "consumo_hora": r.valor_horario,
+                "atipico_diario": r.atipico_diario,
+                "atipico_horario": r.atipico_horario,
+                "limite_diario": r.limite_diario,
+                "limite_horario": r.limite_horario,
+                "n_referencia_diaria": r.n_diario,
+                "n_referencia_horaria": r.n_horario,
+                "posicion_diaria": r.posicion_diaria,
+                "total_posiciones_diarias": r.total_posiciones_diarias,
+                "percentil_diario": r.percentil_diario,
+                "posicion_horaria": r.posicion_horaria,
+                "total_posiciones_horarias": r.total_posiciones_horarias,
+                "percentil_horario": r.percentil_horario,
+            })
 
-    # 2) Mapeo completo: qué datos forman cada Ciudad + Cliente y qué
-    # posición ocupa cada observación histórica.
-    mapeo_path = REPORT_DIR / "mapeo_historico_ciudad_cliente.csv"
-    with mapeo_path.open("w", newline="", encoding="utf-8-sig") as archivo:
+    diario_path = REPORT_DIR / "mapeo_consumo_total_por_fecha.csv"
+    with diario_path.open("w", newline="", encoding="utf-8-sig") as archivo:
         writer = csv.writer(archivo)
-        writer.writerow(
-            [
-                "Ciudad", "Cliente", "posicion", "ConsumoHora",
-                "Fecha", "hora", "idVBox", "Sucursal", "Area",
-            ]
-        )
-        for (ciudad, cliente), perfil in sorted(modelo.perfiles.items()):
-            for posicion, obs in enumerate(
-                perfil.observaciones_ordenadas, start=1
-            ):
-                valor, fecha, hora, id_vbox, sucursal, area = obs
-                writer.writerow(
-                    [
-                        ciudad, cliente, posicion, valor,
-                        fecha, hora, id_vbox, sucursal, area,
-                    ]
-                )
+        writer.writerow(["idVBox", "Sucursal", "Area", "Fecha", "consumo_total"])
+        for clave, perfil in sorted(modelo.perfiles_diarios.items()):
+            for valor, fecha in perfil.observaciones:
+                writer.writerow([clave[0], perfil.sucursal, perfil.area, fecha, valor])
 
-    # 3) Resumen por Ciudad + Cliente.
-    filas_resumen = []
-    for (ciudad, cliente), perfil in sorted(modelo.perfiles.items()):
-        candidatos = [
-            r for r in resultados
-            if r.ciudad == ciudad and r.cliente == cliente
-        ]
-        positivos_grupo = [r for r in candidatos if r.es_atipico]
-        filas_resumen.append(
-            {
-                "Ciudad": ciudad,
-                "Cliente": cliente,
-                "n_historico": perfil.n,
-                "candidatos_evaluados": len(candidatos),
-                "atipicos_positivos": len(positivos_grupo),
-                "mediana": perfil.mediana,
-                "q1": perfil.q1,
-                "q3": perfil.q3,
-                "limite_superior": perfil.limite_superior,
-            }
-        )
+    horario_path = REPORT_DIR / "mapeo_consumo_hora_por_fecha.csv"
+    with horario_path.open("w", newline="", encoding="utf-8-sig") as archivo:
+        writer = csv.writer(archivo)
+        writer.writerow(["idVBox", "Sucursal", "Area", "Fecha", "hora", "consumo_hora"])
+        for clave, perfil in sorted(modelo.perfiles_horarios.items()):
+            for valor, hora in sorted(perfil.observaciones, key=lambda x: x[1]):
+                writer.writerow([
+                    clave[0], perfil.sucursal, perfil.area, perfil.fecha, hora, valor
+                ])
 
-    resumen_path = REPORT_DIR / "resumen_ciudad_cliente.csv"
-    pd.DataFrame(filas_resumen).to_csv(
-        resumen_path,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    # 4) PDF + gráficas para los casos más alejados del límite.
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
-    except ImportError:
-        print(
-            "[ATÍPICO POSITIVO] Evidencia CSV generada. "
-            "Instala matplotlib para generar PDF y gráficas."
-        )
-        return
-
-    pdf_path = REPORT_DIR / "reporte_funcionamiento.pdf"
-
-    ordenados = sorted(
-        positivos,
-        key=lambda r: (
-            r.valor / r.limite
-            if r.limite and r.limite > 0
-            else r.valor
-        ),
-        reverse=True,
-    )
-
-    with PdfPages(pdf_path) as pdf:
-        fig = plt.figure(figsize=(11, 8.5))
-        fig.text(
-            0.07, 0.93,
-            "Reporte de funcionamiento - ATÍPICO POSITIVO",
-            fontsize=18,
-        )
-        texto = (
-            f"Modelo: agrupación por Ciudad + Cliente\n"
-            f"Versión: {modelo.version}\n"
-            f"Entrenado en: {modelo.entrenado_en}\n\n"
-            f"Perfiles Ciudad + Cliente: {len(modelo.perfiles)}\n"
-            f"Candidatos finales evaluados: {len(resultados)}\n"
-            f"Atípicos positivos: {len(positivos)}\n\n"
-            "Criterio:\n"
-            "Cada consumo se compara exclusivamente con los consumos "
-            "históricos positivos de su misma Ciudad + Cliente.\n"
-            "El límite superior es el mayor entre:\n"
-            "  - mediana + 3.5 * (1.4826 * MAD)\n"
-            "  - Q3 + 1.5 * IQR\n\n"
-            "Para cada atípico se conserva su posición dentro del "
-            "mapeo ordenado y el percentil correspondiente.\n\n"
-            "Archivos de soporte:\n"
-            "  - detalle_atipicos_positivos.csv\n"
-            "  - resumen_ciudad_cliente.csv\n"
-            "  - mapeo_historico_ciudad_cliente.csv"
-        )
-        fig.text(0.07, 0.84, texto, va="top", fontsize=11)
-        plt.axis("off")
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-        for indice, r in enumerate(ordenados[:max_graficas], start=1):
-            perfil = modelo.perfiles.get((r.ciudad, r.cliente))
-            if not perfil:
-                continue
-
-            valores = np.asarray(perfil.valores_ordenados, dtype=float)
-            posiciones = np.arange(1, len(valores) + 1)
-
-            fig, ax = plt.subplots(figsize=(11, 6))
-            ax.plot(posiciones, valores, linewidth=1.2)
-            ax.axhline(
-                r.limite if r.limite is not None else perfil.limite_superior,
-                linestyle="--",
-                label=(
-                    f"Límite = "
-                    f"{(r.limite if r.limite is not None else perfil.limite_superior):.2f}"
-                ),
-            )
-            ax.scatter(
-                [r.posicion],
-                [r.valor],
-                s=80,
-                zorder=5,
-                label=(
-                    f"Atípico: {r.valor:.2f} "
-                    f"(posición {r.posicion}/{r.total_posiciones})"
-                ),
-            )
-            ax.set_title(
-                f"{r.ciudad} | {r.cliente}\n"
-                f"idVBox {r.consumo.idVBox} - "
-                f"{r.consumo.Sucursal} - {r.consumo.Area}"
-            )
-            ax.set_xlabel("Posición dentro del grupo Ciudad + Cliente")
-            ax.set_ylabel("ConsumoHora")
-            ax.legend()
-            ax.grid(alpha=0.2)
-
-            nota = (
-                f"Percentil: {r.percentil:.2f}% | "
-                f"Mediana: {perfil.mediana:.2f} | "
-                f"Q1: {perfil.q1:.2f} | Q3: {perfil.q3:.2f}"
-            )
-            fig.text(0.5, 0.01, nota, ha="center", fontsize=9)
-            fig.tight_layout(rect=[0, 0.04, 1, 1])
-
-            nombre = (
-                f"{indice:02d}_"
-                f"{_nombre_archivo(r.ciudad)}_"
-                f"{_nombre_archivo(r.cliente)}_"
-                f"{r.consumo.idVBox}.png"
-            )
-            fig.savefig(graficas_dir / nombre, dpi=160, bbox_inches="tight")
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
-
+    print(f"[ATÍPICO POSITIVO] Evidencia generada en {REPORT_DIR}")
     print(
-        f"[ATÍPICO POSITIVO] Evidencia generada en {REPORT_DIR}"
-    )
-    print(
-        f"[ATÍPICO POSITIVO] Reporte PDF: {pdf_path.name} | "
-        f"gráficas: {min(len(positivos), max_graficas)}"
+        "[ATÍPICO POSITIVO] Mapas: "
+        f"{diario_path.name} | {horario_path.name}"
     )
 
 
@@ -610,12 +481,7 @@ def aplicar_modelo_atipicos_positivos(
     registros_db: dict,
     modelo: ModeloAtipicosPositivos,
 ) -> tuple[list[int], list[int], list[ResultadoAtipicoPositivo]]:
-    """Evalúa únicamente los candidatos finales.
-
-    Si cumple el criterio, se marca ATÍPICO POSITIVO.
-    Si no cumple, el tag queda vacío.
-    También genera evidencia auditable del mapeo Ciudad + Cliente.
-    """
+    """Evalúa solo registros que terminaron el flujo normal sin clasificación."""
     ids_positivos: list[int] = []
     ids_vacios: list[int] = []
     resultados: list[ResultadoAtipicoPositivo] = []
@@ -627,9 +493,7 @@ def aplicar_modelo_atipicos_positivos(
         resultado = modelo.evaluar(consumo)
         resultados.append(resultado)
 
-        registro: ConsumoDB | None = registros_db.get(
-            clave_consumo(consumo)
-        )
+        registro: ConsumoDB | None = registros_db.get(clave_consumo(consumo))
         if not registro or registro.id is None:
             continue
 
@@ -641,5 +505,4 @@ def aplicar_modelo_atipicos_positivos(
             ids_vacios.append(registro.id)
 
     generar_evidencia_atipicos_positivos(resultados, modelo)
-
     return ids_positivos, ids_vacios, resultados

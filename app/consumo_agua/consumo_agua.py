@@ -25,11 +25,11 @@ from .services.consumo_service import (
     ejecutar_por_dia,
     verificar_sincronizacion,
 )
-from .services.historico_parquet import obtener_consumos_con_cache
+from .services.historico_parquet import obtener_consumos_con_cache, leer_historico
 from .services.atipicos_positivos import (
     MODEL_PATH,
-    ModeloAtipicosPositivos,
     aplicar_modelo_atipicos_positivos,
+    entrenar_y_guardar_modelo,
 )
 from .utils.normalizacion import clave_consumo, clave_medidor, normalizar_medidor
 
@@ -60,6 +60,17 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
         print("[ERROR] MSSQL no devolvió datos.")
         return []
     total_recibidos = len(consumos)
+
+    print("\n[ENTRENAMIENTO] ENTRENANDO IA DE ATÍPICOS POSITIVOS")
+    df_entrenamiento = leer_historico()
+    if df_entrenamiento.empty:
+        print("[ENTRENAMIENTO] Sin histórico disponible; se crea modelo vacío.")
+    modelo_atipicos = entrenar_y_guardar_modelo(df_entrenamiento)
+    print(
+        f"[ENTRENAMIENTO] PKL actualizado: {MODEL_PATH} | "
+        f"perfiles diarios: {len(modelo_atipicos.perfiles_diarios)} | "
+        f"perfiles horarios: {len(modelo_atipicos.perfiles_horarios)}"
+    )
 
     print("\n[SETPOINT] Aplicando setpoints...")
     aplicar_setpoints(consumos, setpoints)
@@ -148,25 +159,28 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     actualizar_sin_categorizar(ids)
 
     print("\n[7/7] EVALUANDO ATÍPICOS POSITIVOS")
-    if MODEL_PATH.exists():
-        modelo_atipicos = ModeloAtipicosPositivos.cargar(MODEL_PATH)
-        ids_positivos, ids_vacios, resultados_atipicos = (
-            aplicar_modelo_atipicos_positivos(
-                consumos, registros_db, modelo_atipicos
-            )
+    ids_positivos, ids_vacios, resultados_atipicos = (
+        aplicar_modelo_atipicos_positivos(
+            consumos, registros_db, modelo_atipicos
         )
-        actualizar_tags_atipicos_positivos(ids_positivos, ids_vacios)
-        con_perfil = sum(r.limite is not None for r in resultados_atipicos)
-        print(
-            f"[ATÍPICO POSITIVO] Candidatos: {len(resultados_atipicos)} | "
-            f"con perfil: {con_perfil} | positivos: {len(ids_positivos)} | "
-            f"vacíos: {len(ids_vacios)}"
-        )
-    else:
-        print(
-            f"[ATÍPICO POSITIVO] Sin modelo en {MODEL_PATH}. "
-            "Se conserva SIN CATEGORIZAR hasta entrenar el PKL."
-        )
+    )
+    actualizar_tags_atipicos_positivos(ids_positivos, ids_vacios)
+    con_perfil = sum(r.tiene_perfil for r in resultados_atipicos)
+    diarios = sum(r.atipico_diario for r in resultados_atipicos)
+    horarios = sum(r.atipico_horario for r in resultados_atipicos)
+    ambos = sum(
+        r.atipico_diario and r.atipico_horario
+        for r in resultados_atipicos
+    )
+    print(
+        f"[ATÍPICO POSITIVO] Candidatos: {len(resultados_atipicos)} | "
+        f"con perfil: {con_perfil} | positivos: {len(ids_positivos)} | "
+        f"vacíos: {len(ids_vacios)}"
+    )
+    print(
+        f"[ATÍPICO POSITIVO] Diario: {diarios} | "
+        f"Horario: {horarios} | Ambos: {ambos}"
+    )
 
     verificar_sincronizacion(consumos, registros_db)
 
