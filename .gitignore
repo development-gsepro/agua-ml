@@ -209,4 +209,13 @@ __marimo__/
 
 TODO.md
 logs/
-*.txt
+
+*.xlsx
+*.csv
+# Generated local ML/cache artifacts
+data/*.parquet
+data/*.meta.json
+data/models/*.pkl
+!data/.gitkeep
+!data/models/.gitkeep
+data/reportes_atipicos/
