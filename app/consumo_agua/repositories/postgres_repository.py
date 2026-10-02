@@ -193,8 +193,7 @@ def limpiar_tags_periodo(fecha_inicio, fecha_fin) -> None:
         UPDATE public.consumo_agua
         SET tag = ''
         WHERE "Fecha" >= %s
-          AND "Fecha" <= %s
-    '''
+           AND "Fecha" < (%s::date + INTERVAL '1 day')    '''
 
     with get_conn() as conn:
         with conn.cursor() as cursor:
