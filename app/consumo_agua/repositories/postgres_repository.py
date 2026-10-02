@@ -187,3 +187,20 @@ def actualizar_sin_categorizar(ids: list[int]) -> None:
             cursor.execute(query, (ids,))
         conn.commit()
     print(f"[POSTGRES] {len(ids)} registros -> SIN CATEGORIZAR")
+
+def limpiar_tags_periodo(fecha_inicio, fecha_fin) -> None:
+    query = '''
+        UPDATE public.consumo_agua
+        SET tag = ''
+        WHERE "Fecha" >= %s
+          AND "Fecha" <= %s
+    '''
+
+    with get_conn() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(query, (fecha_inicio, fecha_fin))
+            afectados = cursor.rowcount
+        conn.commit()
+
+    print(f"[POSTGRES] Tags limpiados para el periodo: {afectados}")
+

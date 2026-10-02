@@ -5,6 +5,19 @@ from typing import Optional
 HORAS_MADRUGADA = set(range(0, 6))
 
 
+def es_medidor_virtual(area: object) -> bool:
+    """Los medidores cuyo Area contiene * son virtuales y no se clasifican."""
+    return "*" in str(area or "")
+
+
+def es_hora_madrugada(hora: object) -> bool:
+    """Ventana disponible con la granularidad horaria actual: 00:xx a <06:00."""
+    try:
+        return int(hora) in HORAS_MADRUGADA
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass(slots=True)
 class ConsumoAgua:
     idVBox: int
@@ -89,5 +102,5 @@ class DiaConsumo:
         return sum(
             float(r.consumo.ConsumoHora or 0)
             for r in self.registros
-            if r.consumo.hora in HORAS_MADRUGADA
+            if es_hora_madrugada(r.consumo.hora)
         )

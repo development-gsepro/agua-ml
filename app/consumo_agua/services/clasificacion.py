@@ -1,6 +1,8 @@
 from datetime import date, timedelta
 
-from ..models.consumo import ConsumoAgua, ConsumoDB, DiaConsumo
+from ..models.consumo import (
+    ConsumoAgua, ConsumoDB, DiaConsumo, es_hora_madrugada, es_medidor_virtual,
+)
 from ..repositories.postgres_repository import ActualizadorTags
 from ..utils.normalizacion import clave_consumo, fecha_solo
 
@@ -33,67 +35,93 @@ def evaluar_consumo_elevado(dias: dict[date, DiaConsumo], actualizador: Actualiz
 
 
 def evaluar_fugas(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
-    fechas = sorted(dias)
-    n = len(fechas)
-    for i in range(n):
-        if i + 2 >= n:
-            break
-        if not (
-            fechas[i + 1] == fechas[i] + timedelta(days=1)
-            and fechas[i + 2] == fechas[i + 1] + timedelta(days=1)
-        ):
-            continue
-        d1, d2, d3 = dias[fechas[i]], dias[fechas[i + 1]], dias[fechas[i + 2]]
-        if not (d1.supera_sp and d2.supera_sp and d3.supera_sp):
-            continue
-        if i < 3:
-            continue
-        prev1, prev2, prev3 = dias[fechas[i - 1]], dias[fechas[i - 2]], dias[fechas[i - 3]]
-        if not (
-            fechas[i - 1] == fechas[i] - timedelta(days=1)
-            and fechas[i - 2] == fechas[i] - timedelta(days=2)
-            and fechas[i - 3] == fechas[i] - timedelta(days=3)
-        ):
-            continue
-        if prev1.supera_sp or prev2.supera_sp or prev3.supera_sp:
-            continue
-        tag = "FUGA ACTIVA" if (d1.consumo_24h and d2.consumo_24h and d3.consumo_24h) else "POSIBLE FUGA"
-        actualizador.agregar(d1.registros + d2.registros + d3.registros, tag)
+    """Levanta FUGA ACTIVA/POSIBLE FUGA al cuarto día consecutivo arriba del SP.
 
+    La bandera se aplica únicamente al cuarto día, no retroactivamente a los
+    primeros tres días. Una racha mayor a cuatro días tampoco vuelve a generar
+    la bandera en los días siguientes.
+    """
+    fechas = sorted(dias)
+    for i in range(3, len(fechas)):
+        ventana_fechas = fechas[i - 3:i + 1]
+        if not all(
+            ventana_fechas[j] == ventana_fechas[0] + timedelta(days=j)
+            for j in range(4)
+        ):
+            continue
+
+        ventana = [dias[f] for f in ventana_fechas]
+        if not all(dia.supera_sp for dia in ventana):
+            continue
+
+        # Solo levantar la bandera cuando la racha alcanza cuatro días.
+        # Si el día anterior a la ventana también superaba el SP, ya se había
+        # alcanzado el cuarto día en una fecha previa.
+        if i >= 4:
+            fecha_previa = fechas[i - 4]
+            if (
+                fecha_previa == ventana_fechas[0] - timedelta(days=1)
+                and dias[fecha_previa].supera_sp
+            ):
+                continue
+
+        dia_bandera = ventana[-1]
+        tag = (
+            "FUGA ACTIVA"
+            if all(dia.consumo_24h for dia in ventana)
+            else "POSIBLE FUGA"
+        )
+        actualizador.agregar(dia_bandera.registros, tag)
 
 def evaluar_fuga_reparada(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
+    """Marca FUGA REPARADA al cuarto día consecutivo debajo del SP.
+
+    El día inmediatamente anterior a esos cuatro días debe ser el último día
+    que superó el SP. La etiqueta se aplica únicamente al cuarto día posterior.
+    """
     fechas = sorted(dias)
-    n = len(fechas)
-    for i in range(n - 6):
+    for i in range(4, len(fechas)):
+        fecha_ultima_fuga = fechas[i - 4]
+        posteriores = fechas[i - 3:i + 1]
+
         if not all(
-            fechas[j] == fechas[i] + timedelta(days=j - i)
-            for j in range(i, i + 7)
+            posteriores[j] == fecha_ultima_fuga + timedelta(days=j + 1)
+            for j in range(4)
         ):
             continue
-        ventana = [dias[fechas[j]] for j in range(i, i + 7)]
-        expected = [True] * 3 + [False] * 4
-        fallos = 0
-        for dia, exp in zip(ventana, expected):
-            if dia.supera_sp != exp:
-                fallos += 1
-                if fallos > 1:
-                    break
-        if fallos <= 1:
-            registros = []
-            for dia in ventana[3:]:
-                registros.extend(dia.registros)
-            actualizador.agregar(registros, "FUGA REPARADA")
+        if not dias[fecha_ultima_fuga].supera_sp:
+            continue
 
+        ventana_reparacion = [dias[f] for f in posteriores]
+        if any(dia.supera_sp for dia in ventana_reparacion):
+            continue
+
+        actualizador.agregar(ventana_reparacion[-1].registros, "FUGA REPARADA")
 
 def evaluar_consumo_madrugada(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
+    """Detecta consumo de madrugada sin etiquetar registros fuera de la ventana.
+
+    La fuente actual guarda ``hora`` como entero. Por ello, la ventana solicitada
+    00:05--06:00 se representa con los buckets horarios 0, 1, 2, 3, 4 y 5.
+    """
     for dia in dias.values():
         total = dia.consumo_total
         if total <= 0 or dia.supera_sp:
             continue
-        madrugada = dia.consumo_madrugada
-        if madrugada / total > 0.05:
-            actualizador.agregar(dia.registros, "CONSUMO DE MADRUGADA")
 
+        registros_madrugada = [
+            r for r in dia.registros
+            if es_hora_madrugada(r.consumo.hora)
+        ]
+        if not registros_madrugada:
+            continue
+
+        madrugada = sum(
+            float(r.consumo.ConsumoHora or 0)
+            for r in registros_madrugada
+        )
+        if madrugada / total > 0.05:
+            actualizador.agregar(registros_madrugada, "CONSUMO DE MADRUGADA")
 
 def marcar_offline_y_sin_agua(
     periodo_por_medidor: dict,
@@ -135,13 +163,18 @@ def marcar_offline_y_sin_agua(
             continue
         if consumo_total in (-1, -2):
             actualizador.agregar(registros_ultimo_dia, "MEDIDOR OFFLINE")
-        elif consumo_total == 0:
-            actualizador.agregar(registros_ultimo_dia, "SITIO SIN AGUA")
+        elif consumo_total == 0 and all(
+            float(c.consumoTotal or 0) == 0
+            for c in fechas_dict[ultimo_dia_periodo]
+        ):
+            actualizador.agregar(registros_ultimo_dia, "MEDIDOR SIN AGUA")
 
 
 def preparar_sin_categorizar(consumos: list[ConsumoAgua], registros_db: dict) -> list[int]:
     ids = []
     for consumo in consumos:
+        if es_medidor_virtual(consumo.Area):
+            continue
         if consumo.tag:
             continue
         consumo.tag = "SIN CATEGORIZAR"

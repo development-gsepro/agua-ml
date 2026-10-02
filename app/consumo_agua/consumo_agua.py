@@ -1,12 +1,13 @@
 from datetime import datetime, timedelta
 import time
 
-from .models.consumo import ConsumoAgua
+from .models.consumo import ConsumoAgua, es_medidor_virtual
 from .repositories.postgres_repository import (
     ActualizadorTags,
     actualizar_sin_categorizar,
     insertar_consumos,
     obtener_historico_postgres,
+    limpiar_tags_periodo,
 )
 from .repositories.atipicos_repository import actualizar_tags_atipicos_positivos
 from .services.clasificacion import (
@@ -80,6 +81,8 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     atipicos = 0
     offline = 0
     for consumo in consumos:
+        if es_medidor_virtual(consumo.Area):
+            continue
         total = float(consumo.consumoTotal or 0)
         medidor = normalizar_medidor(consumo.Area)
         if total in (-1, -2):
@@ -100,6 +103,9 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     print("\n[3/7] INSERTANDO EN POSTGRESQL")
     registros_db = insertar_consumos(consumos)
     print(f"[3/7] Registros insertados: {len(registros_db)}")
+
+    print("\n[POSTGRES] LIMPIANDO TAGS ANTERIORES DEL PERIODO")
+    limpiar_tags_periodo(fec_ini, fec_fin)
 
     print("\n[4/7] PREPARANDO MEDIDORES")
     grupos = {}
@@ -143,6 +149,8 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
 
         grupos_todos = {}
         for consumo in consumos:
+            if es_medidor_virtual(consumo.Area):
+                continue
             clave = clave_medidor(consumo.idVBox, consumo.Area)
             grupos_todos.setdefault(clave, []).append(consumo)
         marcar_offline_y_sin_agua(
@@ -202,3 +210,4 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     print(f"Tiempo total: {tiempo_total:.2f} segundos")
     print("#" * 70)
     return consumos
+

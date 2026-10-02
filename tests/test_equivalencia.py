@@ -207,10 +207,10 @@ def build_days(base=False):
 
 
 def test_reglas_clasificacion_equivalentes():
-    for nombre in (
-        "evaluar_consumo_elevado", "evaluar_fugas",
-        "evaluar_fuga_reparada", "evaluar_consumo_madrugada",
-    ):
+    # Estas reglas conservan equivalencia con el monolito solo donde la
+    # especificación de negocio no cambió. Fugas y madrugada fueron ajustadas
+    # posteriormente por requerimiento explícito.
+    for nombre in ("evaluar_consumo_elevado",):
         bdias = build_days(base=True)
         rdias = build_days(base=False)
         ba = BASE.ActualizadorTags()

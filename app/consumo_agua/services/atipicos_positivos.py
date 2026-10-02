@@ -11,7 +11,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from ..models.consumo import ConsumoAgua, ConsumoDB
+from ..models.consumo import ConsumoAgua, ConsumoDB, es_medidor_virtual
 from ..utils.normalizacion import clave_consumo
 
 
@@ -161,7 +161,9 @@ class ModeloAtipicosPositivos:
         trabajo["sucursal_norm"] = trabajo["Sucursal"].map(normalizar_grupo)
         trabajo["area_norm"] = trabajo["Area"].map(normalizar_grupo)
         trabajo = trabajo[
-            trabajo["sucursal_norm"].ne("") & trabajo["area_norm"].ne("")
+            trabajo["sucursal_norm"].ne("")
+            & trabajo["area_norm"].ne("")
+            & ~trabajo["Area"].map(es_medidor_virtual)
         ].copy()
 
         trabajo["idVBox"] = trabajo["idVBox"].astype(int)
@@ -400,6 +402,8 @@ def entrenar_y_guardar_modelo(
 
 
 def es_candidato(consumo: ConsumoAgua) -> bool:
+    if es_medidor_virtual(consumo.Area):
+        return False
     tag = str(consumo.tag or "").strip().upper()
     categoria = str(consumo.categoria or "").strip()
     return tag in {"", TAG_SIN_CATEGORIZAR} and categoria == ""
