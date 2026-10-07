@@ -76,6 +76,9 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     print("\n[SETPOINT] Aplicando setpoints...")
     aplicar_setpoints(consumos, setpoints)
 
+    print("\n[POSTGRES] LIMPIANDO TAGS ANTERIORES DEL PERIODO")
+    limpiar_tags_periodo(fec_ini, fec_fin)
+
     print("\n[2/7] CLASIFICANDO ATÍPICO Y OFFLINE")
     historicos = []
     atipicos = 0
@@ -103,9 +106,6 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     print("\n[3/7] INSERTANDO EN POSTGRESQL")
     registros_db = insertar_consumos(consumos)
     print(f"[3/7] Registros insertados: {len(registros_db)}")
-
-    print("\n[POSTGRES] LIMPIANDO TAGS ANTERIORES DEL PERIODO")
-    limpiar_tags_periodo(fec_ini, fec_fin)
 
     print("\n[4/7] PREPARANDO MEDIDORES")
     grupos = {}
@@ -193,8 +193,13 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     verificar_sincronizacion(consumos, registros_db)
 
     tiempo_total = time.perf_counter() - inicio_total
+    consumos_unicos = {
+        clave_consumo(consumo): consumo
+        for consumo in consumos
+    }
+
     conteo_tags = {}
-    for consumo in consumos:
+    for consumo in consumos_unicos.values():
         tag = consumo.tag or "VACÍO"
         conteo_tags[tag] = conteo_tags.get(tag, 0) + 1
     print("\n" + "#" * 70)
