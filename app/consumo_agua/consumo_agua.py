@@ -89,7 +89,7 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
         total = float(consumo.consumoTotal or 0)
         medidor = normalizar_medidor(consumo.Area)
         if total in (-1, -2):
-            consumo.tag = "OFFLINE"
+            consumo.tag = "MEDIDOR OFFLINE"
             consumo.categoria = f"{total}"
             offline += 1
         elif ((total == 0 and medidor in EXCEPCION_MEDIDORES) or total < -2):
