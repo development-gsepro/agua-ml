@@ -23,7 +23,7 @@ REPORT_DIR = DATA_DIR / "reportes_atipicos"
 
 TAG_ATIPICO_POSITIVO = "ATÍPICO POSITIVO"
 TAG_SIN_CATEGORIZAR = "SIN CATEGORIZAR"
-MODEL_VERSION = 3
+MODEL_VERSION = 4
 
 # Diario: (consumo_total, fecha_iso)
 ObservacionDiaria = tuple[float, str]
@@ -96,6 +96,16 @@ class ResultadoAtipicoPositivo:
     total_posiciones_horarias: int = 0
     percentil_horario: float | None = None
 
+    # Validaciones adicionales agregadas a nivel sucursal.
+    atipico_grupo_diario: bool = False
+    atipico_grupo_horario: bool = False
+    atipico_sucursal_diario: bool = False
+    atipico_sucursal_horario: bool = False
+    valor_sucursal_diario: float = 0.0
+    valor_sucursal_horario: float = 0.0
+    limite_sucursal_diario: float | None = None
+    limite_sucursal_horario: float | None = None
+
     @property
     def tiene_perfil(self) -> bool:
         return self.limite_diario is not None or self.limite_horario is not None
@@ -116,6 +126,11 @@ class ModeloAtipicosPositivos:
         self.min_muestras = int(min_muestras)
         self.perfiles_diarios: dict[tuple[int, str, str], PerfilDiario] = {}
         self.perfiles_horarios: dict[tuple[int, str, str, str], PerfilHorario] = {}
+
+        # Segunda capa: comportamiento completo de la sucursal.
+        self.perfiles_sucursal_diarios: dict[tuple[int, str], PerfilDiario] = {}
+        self.perfiles_sucursal_horarios: dict[tuple[int, str, str], PerfilHorario] = {}
+
         self.entrenado_en: str | None = None
         self.version = MODEL_VERSION
 
@@ -263,8 +278,147 @@ class ModeloAtipicosPositivos:
             if len(validos) >= self.min_muestras:
                 horarios[clave] = self._perfil_horario(clave, grupo)
 
+        # --------------------------------------------------------------
+        # Validación adicional por SUCURSAL.
+        #
+        # consumoTotal está repetido en cada fila horaria, por eso para
+        # sucursal/día primero tomamos una sola observación por Area y fecha
+        # y después sumamos todas las áreas físicas de la sucursal.
+        # --------------------------------------------------------------
+        sucursal_diarios: dict[tuple[int, str], PerfilDiario] = {}
+
+        for raw_clave, grupo in trabajo.groupby(
+            ["idVBox", "sucursal_norm"],
+            sort=True,
+            dropna=False,
+        ):
+            por_area_dia = (
+                grupo.sort_values(
+                    ["fecha_dia", "area_norm", "hora"],
+                    kind="stable",
+                )
+                .drop_duplicates(
+                    subset=["fecha_dia", "area_norm"],
+                    keep="first",
+                )
+            )
+
+            por_area_dia = por_area_dia[
+                np.isfinite(por_area_dia["consumoTotal"])
+                & (por_area_dia["consumoTotal"] > 0)
+            ]
+
+            por_dia = (
+                por_area_dia
+                .groupby("fecha_dia", as_index=False)["consumoTotal"]
+                .sum()
+                .sort_values("fecha_dia", kind="stable")
+            )
+
+            por_dia = por_dia[
+                np.isfinite(por_dia["consumoTotal"])
+                & (por_dia["consumoTotal"] > 0)
+            ]
+
+            if len(por_dia) >= self.min_muestras:
+                valores = por_dia["consumoTotal"].to_numpy(dtype=float)
+                mediana, mad, q1, q3, limite = self._estadisticas(valores)
+
+                clave_sucursal = (
+                    int(raw_clave[0]),
+                    str(raw_clave[1]),
+                )
+
+                sucursal_diarios[clave_sucursal] = PerfilDiario(
+                    id_vbox=clave_sucursal[0],
+                    sucursal=clave_sucursal[1],
+                    area="",
+                    n=len(valores),
+                    mediana=mediana,
+                    mad=mad,
+                    q1=q1,
+                    q3=q3,
+                    limite_superior=limite,
+                    observaciones=tuple(
+                        (
+                            float(f.consumoTotal),
+                            _fecha_iso(f.fecha_dia),
+                        )
+                        for f in por_dia.itertuples(index=False)
+                    ),
+                )
+
+        # Para sucursal/hora sumamos ConsumoHora de todas las áreas físicas
+        # para cada una de las horas del día.
+        sucursal_horarios: dict[tuple[int, str, str], PerfilHorario] = {}
+
+        for raw_clave, grupo in trabajo.groupby(
+            ["idVBox", "sucursal_norm", "fecha_dia"],
+            sort=True,
+            dropna=False,
+        ):
+            por_area_hora = (
+                grupo.sort_values(
+                    ["hora", "area_norm"],
+                    kind="stable",
+                )
+                .drop_duplicates(
+                    subset=["hora", "area_norm"],
+                    keep="first",
+                )
+            )
+
+            por_area_hora = por_area_hora[
+                np.isfinite(por_area_hora["ConsumoHora"])
+                & (por_area_hora["ConsumoHora"] > 0)
+            ]
+
+            por_hora = (
+                por_area_hora
+                .groupby("hora", as_index=False)["ConsumoHora"]
+                .sum()
+                .sort_values("hora", kind="stable")
+            )
+
+            por_hora = por_hora[
+                np.isfinite(por_hora["ConsumoHora"])
+                & (por_hora["ConsumoHora"] > 0)
+            ]
+
+            if len(por_hora) >= self.min_muestras:
+                valores = por_hora["ConsumoHora"].to_numpy(dtype=float)
+                mediana, mad, q1, q3, limite = self._estadisticas(valores)
+
+                clave_sucursal = (
+                    int(raw_clave[0]),
+                    str(raw_clave[1]),
+                    _fecha_iso(raw_clave[2]),
+                )
+
+                sucursal_horarios[clave_sucursal] = PerfilHorario(
+                    id_vbox=clave_sucursal[0],
+                    sucursal=clave_sucursal[1],
+                    area="",
+                    fecha=clave_sucursal[2],
+                    n=len(valores),
+                    mediana=mediana,
+                    mad=mad,
+                    q1=q1,
+                    q3=q3,
+                    limite_superior=limite,
+                    observaciones=tuple(
+                        (
+                            float(f.ConsumoHora),
+                            int(f.hora),
+                        )
+                        for f in por_hora.itertuples(index=False)
+                    ),
+                )
+
         self.perfiles_diarios = diarios
         self.perfiles_horarios = horarios
+        self.perfiles_sucursal_diarios = sucursal_diarios
+        self.perfiles_sucursal_horarios = sucursal_horarios
         self.entrenado_en = datetime.now().isoformat(timespec="seconds")
         return self
 
@@ -336,7 +490,78 @@ class ModeloAtipicosPositivos:
         percentil = 100.0 * posicion / total
         return bool(valor > limite), limite, len(referencia), posicion, total, percentil
 
-    def evaluar(self, consumo: ConsumoAgua) -> ResultadoAtipicoPositivo:
+    def _evaluar_sucursal_diario(
+        self,
+        consumo: ConsumoAgua,
+        valor: float,
+    ) -> tuple[bool, float | None, int]:
+        if not np.isfinite(valor) or valor <= 0:
+            return False, None, 0
+
+        clave = (
+            int(consumo.idVBox),
+            normalizar_grupo(consumo.Sucursal),
+        )
+        perfil = self.perfiles_sucursal_diarios.get(clave)
+        if perfil is None:
+            return False, None, 0
+
+        fecha_actual = _fecha_iso(consumo.Fecha)
+        referencia = np.asarray(
+            [
+                v
+                for v, fecha in perfil.observaciones
+                if fecha != fecha_actual
+            ],
+            dtype=float,
+        )
+        referencia = referencia[np.isfinite(referencia)]
+
+        if len(referencia) < self.min_muestras:
+            return False, None, len(referencia)
+
+        _med, _mad, _q1, _q3, limite = self._estadisticas(referencia)
+        return bool(valor > limite), limite, len(referencia)
+
+    def _evaluar_sucursal_horario(
+        self,
+        consumo: ConsumoAgua,
+        valor: float,
+    ) -> tuple[bool, float | None, int]:
+        if not np.isfinite(valor) or valor <= 0:
+            return False, None, 0
+
+        clave = (
+            int(consumo.idVBox),
+            normalizar_grupo(consumo.Sucursal),
+            _fecha_iso(consumo.Fecha),
+        )
+        perfil = self.perfiles_sucursal_horarios.get(clave)
+        if perfil is None:
+            return False, None, 0
+
+        referencia = np.asarray(
+            [
+                v
+                for v, hora in perfil.observaciones
+                if int(hora) != int(consumo.hora)
+            ],
+            dtype=float,
+        )
+        referencia = referencia[np.isfinite(referencia)]
+
+        if len(referencia) < self.min_muestras:
+            return False, None, len(referencia)
+
+        _med, _mad, _q1, _q3, limite = self._estadisticas(referencia)
+        return bool(valor > limite), limite, len(referencia)
+
+    def evaluar(
+        self,
+        consumo: ConsumoAgua,
+        valor_sucursal_diario: float = 0.0,
+        valor_sucursal_horario: float = 0.0,
+    ) -> ResultadoAtipicoPositivo:
         try:
             valor_diario = float(consumo.consumoTotal or 0)
         except (TypeError, ValueError, OverflowError):
@@ -349,14 +574,56 @@ class ModeloAtipicosPositivos:
         diario = self._evaluar_diario(consumo)
         horario = self._evaluar_horario(consumo)
 
-        atipico_diario, limite_d, n_d, pos_d, total_d, pct_d = diario
-        atipico_horario, limite_h, n_h, pos_h, total_h, pct_h = horario
+        (
+            atipico_grupo_diario,
+            limite_d,
+            n_d,
+            pos_d,
+            total_d,
+            pct_d,
+        ) = diario
+
+        (
+            atipico_grupo_horario,
+            limite_h,
+            n_h,
+            pos_h,
+            total_h,
+            pct_h,
+        ) = horario
+
+        (
+            atipico_sucursal_diario,
+            limite_sd,
+            _n_sd,
+        ) = self._evaluar_sucursal_diario(
+            consumo,
+            float(valor_sucursal_diario or 0),
+        )
+
+        (
+            atipico_sucursal_horario,
+            limite_sh,
+            _n_sh,
+        ) = self._evaluar_sucursal_horario(
+            consumo,
+            float(valor_sucursal_horario or 0),
+        )
+
+        atipico_diario = bool(
+            atipico_grupo_diario
+            or atipico_sucursal_diario
+        )
+        atipico_horario = bool(
+            atipico_grupo_horario
+            or atipico_sucursal_horario
+        )
 
         return ResultadoAtipicoPositivo(
             consumo=consumo,
             es_atipico=bool(atipico_diario or atipico_horario),
-            atipico_diario=bool(atipico_diario),
-            atipico_horario=bool(atipico_horario),
+            atipico_diario=atipico_diario,
+            atipico_horario=atipico_horario,
             valor_diario=valor_diario,
             valor_horario=valor_horario,
             limite_diario=limite_d,
@@ -369,6 +636,14 @@ class ModeloAtipicosPositivos:
             posicion_horaria=pos_h,
             total_posiciones_horarias=total_h,
             percentil_horario=pct_h,
+            atipico_grupo_diario=bool(atipico_grupo_diario),
+            atipico_grupo_horario=bool(atipico_grupo_horario),
+            atipico_sucursal_diario=bool(atipico_sucursal_diario),
+            atipico_sucursal_horario=bool(atipico_sucursal_horario),
+            valor_sucursal_diario=float(valor_sucursal_diario or 0),
+            valor_sucursal_horario=float(valor_sucursal_horario or 0),
+            limite_sucursal_diario=limite_sd,
+            limite_sucursal_horario=limite_sh,
         )
 
     def guardar(self, ruta: Path = MODEL_PATH) -> None:
@@ -423,7 +698,11 @@ def generar_evidencia_atipicos_positivos(
         "idVBox", "Sucursal", "Area", "Fecha", "hora",
         "consumo_total", "consumo_hora",
         "atipico_diario", "atipico_horario",
+        "atipico_grupo_diario", "atipico_grupo_horario",
+        "atipico_sucursal_diario", "atipico_sucursal_horario",
+        "consumo_sucursal_diario", "consumo_sucursal_horario",
         "limite_diario", "limite_horario",
+        "limite_sucursal_diario", "limite_sucursal_horario",
         "n_referencia_diaria", "n_referencia_horaria",
         "posicion_diaria", "total_posiciones_diarias", "percentil_diario",
         "posicion_horaria", "total_posiciones_horarias", "percentil_horario",
@@ -443,8 +722,16 @@ def generar_evidencia_atipicos_positivos(
                 "consumo_hora": r.valor_horario,
                 "atipico_diario": r.atipico_diario,
                 "atipico_horario": r.atipico_horario,
+                "atipico_grupo_diario": r.atipico_grupo_diario,
+                "atipico_grupo_horario": r.atipico_grupo_horario,
+                "atipico_sucursal_diario": r.atipico_sucursal_diario,
+                "atipico_sucursal_horario": r.atipico_sucursal_horario,
+                "consumo_sucursal_diario": r.valor_sucursal_diario,
+                "consumo_sucursal_horario": r.valor_sucursal_horario,
                 "limite_diario": r.limite_diario,
                 "limite_horario": r.limite_horario,
+                "limite_sucursal_diario": r.limite_sucursal_diario,
+                "limite_sucursal_horario": r.limite_sucursal_horario,
                 "n_referencia_diaria": r.n_diario,
                 "n_referencia_horaria": r.n_horario,
                 "posicion_diaria": r.posicion_diaria,
@@ -473,6 +760,48 @@ def generar_evidencia_atipicos_positivos(
                     clave[0], perfil.sucursal, perfil.area, perfil.fecha, hora, valor
                 ])
 
+    sucursal_diario_path = REPORT_DIR / "mapeo_sucursal_total_por_fecha.csv"
+    with sucursal_diario_path.open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as archivo:
+        writer = csv.writer(archivo)
+        writer.writerow(
+            ["idVBox", "Sucursal", "Fecha", "consumo_sucursal"]
+        )
+        for _clave, perfil in sorted(
+            modelo.perfiles_sucursal_diarios.items()
+        ):
+            for valor, fecha in perfil.observaciones:
+                writer.writerow([
+                    perfil.id_vbox,
+                    perfil.sucursal,
+                    fecha,
+                    valor,
+                ])
+
+    sucursal_horario_path = REPORT_DIR / "mapeo_sucursal_hora_por_fecha.csv"
+    with sucursal_horario_path.open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as archivo:
+        writer = csv.writer(archivo)
+        writer.writerow(
+            ["idVBox", "Sucursal", "Fecha", "hora", "consumo_sucursal"]
+        )
+        for _clave, perfil in sorted(
+            modelo.perfiles_sucursal_horarios.items()
+        ):
+            for valor, hora in sorted(
+                perfil.observaciones,
+                key=lambda x: x[1],
+            ):
+                writer.writerow([
+                    perfil.id_vbox,
+                    perfil.sucursal,
+                    perfil.fecha,
+                    hora,
+                    valor,
+                ])
+
     print(f"[ATÍPICO POSITIVO] Evidencia generada en {REPORT_DIR}")
     print(
         "[ATÍPICO POSITIVO] Mapas: "
@@ -490,11 +819,98 @@ def aplicar_modelo_atipicos_positivos(
     ids_vacios: list[int] = []
     resultados: list[ResultadoAtipicoPositivo] = []
 
+    # Materializamos porque necesitamos recorrer la corrida completa para
+    # calcular el consumo agregado de cada sucursal.
+    consumos = list(consumos)
+
+    # Una sola observación de consumoTotal por Area y día.
+    areas_diarias: dict[tuple[int, str, str, str], float] = {}
+
+    # Una sola observación de ConsumoHora por Area, día y hora.
+    areas_horarias: dict[tuple[int, str, str, str, int], float] = {}
+
+    for consumo in consumos:
+        if es_medidor_virtual(consumo.Area):
+            continue
+
+        try:
+            id_vbox = int(consumo.idVBox)
+            sucursal = normalizar_grupo(consumo.Sucursal)
+            area = normalizar_grupo(consumo.Area)
+            fecha = _fecha_iso(consumo.Fecha)
+            hora = int(consumo.hora)
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+        if not sucursal or not area:
+            continue
+
+        try:
+            total = float(consumo.consumoTotal or 0)
+        except (TypeError, ValueError, OverflowError):
+            total = 0.0
+
+        if np.isfinite(total) and total > 0:
+            areas_diarias.setdefault(
+                (id_vbox, sucursal, area, fecha),
+                total,
+            )
+
+        try:
+            valor_hora = float(consumo.ConsumoHora or 0)
+        except (TypeError, ValueError, OverflowError):
+            valor_hora = 0.0
+
+        if np.isfinite(valor_hora) and valor_hora > 0:
+            areas_horarias.setdefault(
+                (id_vbox, sucursal, area, fecha, hora),
+                valor_hora,
+            )
+
+    sucursal_diaria: dict[tuple[int, str, str], float] = {}
+    for (
+        id_vbox,
+        sucursal,
+        _area,
+        fecha,
+    ), valor in areas_diarias.items():
+        clave = (id_vbox, sucursal, fecha)
+        sucursal_diaria[clave] = sucursal_diaria.get(clave, 0.0) + valor
+
+    sucursal_horaria: dict[tuple[int, str, str, int], float] = {}
+    for (
+        id_vbox,
+        sucursal,
+        _area,
+        fecha,
+        hora,
+    ), valor in areas_horarias.items():
+        clave = (id_vbox, sucursal, fecha, hora)
+        sucursal_horaria[clave] = sucursal_horaria.get(clave, 0.0) + valor
+
     for consumo in consumos:
         if not es_candidato(consumo):
             continue
 
-        resultado = modelo.evaluar(consumo)
+        try:
+            clave_sd = (
+                int(consumo.idVBox),
+                normalizar_grupo(consumo.Sucursal),
+                _fecha_iso(consumo.Fecha),
+            )
+            clave_sh = (*clave_sd, int(consumo.hora))
+        except (TypeError, ValueError, OverflowError):
+            clave_sd = None
+            clave_sh = None
+
+        valor_sd = sucursal_diaria.get(clave_sd, 0.0) if clave_sd else 0.0
+        valor_sh = sucursal_horaria.get(clave_sh, 0.0) if clave_sh else 0.0
+
+        resultado = modelo.evaluar(
+            consumo,
+            valor_sucursal_diario=valor_sd,
+            valor_sucursal_horario=valor_sh,
+        )
         resultados.append(resultado)
 
         registro: ConsumoDB | None = registros_db.get(clave_consumo(consumo))
