@@ -73,31 +73,48 @@ def evaluar_fugas(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
         )
         actualizador.agregar(dia_bandera.registros, tag)
 
-def evaluar_fuga_reparada(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
+def evaluar_fuga_reparada(
+    dias: dict[date, DiaConsumo],
+    actualizador: ActualizadorTags
+):
     """Marca FUGA REPARADA al cuarto día consecutivo debajo del SP.
 
-    El día inmediatamente anterior a esos cuatro días debe ser el último día
-    que superó el SP. La etiqueta se aplica únicamente al cuarto día posterior.
+    El día inmediatamente anterior a esos cuatro días debe ser un día
+    que superó o igualó el SP.
+
+    Un consumo igual al SP NO se considera debajo del SP.
     """
+
     fechas = sorted(dias)
+
     for i in range(4, len(fechas)):
-        fecha_ultima_fuga = fechas[i - 4]
+        fecha_anterior = fechas[i - 4]
         posteriores = fechas[i - 3:i + 1]
 
+        # Los cuatro días deben ser consecutivos
         if not all(
-            posteriores[j] == fecha_ultima_fuga + timedelta(days=j + 1)
+            posteriores[j] == fecha_anterior + timedelta(days=j + 1)
             for j in range(4)
         ):
             continue
-        if not dias[fecha_ultima_fuga].supera_sp:
+
+        # El día anterior debe haber cumplido o superado el SP
+        if not dias[fecha_anterior].supera_sp:
             continue
 
         ventana_reparacion = [dias[f] for f in posteriores]
+
+        # Los cuatro días deben estar estrictamente debajo del SP.
+        # Si alguno cumple o supera el SP, se rompe la secuencia.
         if any(dia.supera_sp for dia in ventana_reparacion):
             continue
 
-        actualizador.agregar(ventana_reparacion[-1].registros, "FUGA REPARADA")
-
+        # La etiqueta solamente se aplica al cuarto día
+        actualizador.agregar(
+            ventana_reparacion[-1].registros,
+            "FUGA REPARADA"
+        )
+        
 def evaluar_consumo_madrugada(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
     """Detecta consumo de madrugada sin etiquetar registros fuera de la ventana.
 
