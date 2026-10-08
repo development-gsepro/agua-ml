@@ -1385,7 +1385,7 @@ def clasificador(
         medidor = normalizar_medidor(consumo.Area)
 
         if total in (-1, -2):
-            consumo.tag = "OFFLINE"
+            consumo.tag = "MEDIDOR OFFLINE"
             consumo.categoria = f"{total}"
             offline += 1
 
