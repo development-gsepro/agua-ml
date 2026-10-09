@@ -32,6 +32,8 @@ from .services.atipicos_positivos import (
     MODEL_PATH,
     aplicar_modelo_atipicos_positivos,
     entrenar_y_guardar_modelo,
+    TAG_ATIPICO_POSITIVO_DIA,
+    TAG_ATIPICO_POSITIVO_HORA,
 )
 from .utils.normalizacion import clave_consumo, clave_medidor, normalizar_medidor
 
