@@ -130,9 +130,9 @@ def test_aplicacion_respeta_candidatos(tmp_path, monkeypatch):
         [positivo, normal, protegido], registros, modelo
     )
 
-    assert ids_pos == [1]
+    assert ids_pos == {1: "ATÍPICO POSITIVO HORA"}
     assert ids_vacios == [2]
-    assert positivo.tag == "ATÍPICO POSITIVO"
+    assert positivo.tag == "ATÍPICO POSITIVO HORA"
     assert normal.tag == ""
     assert protegido.tag == "FUGA ACTIVA"
     assert len(resultados) == 2
@@ -317,8 +317,8 @@ def test_sucursal_diaria_detecta_atipico_aunque_grupos_no_marcan(
     assert all(r.atipico_grupo_diario is False for r in resultados)
     assert all(r.atipico_sucursal_diario is True for r in resultados)
 
-    assert principal.tag == "ATÍPICO POSITIVO"
-    assert filtrada.tag == "ATÍPICO POSITIVO"
+    assert principal.tag == "ATÍPICO POSITIVO DÍA"
+    assert filtrada.tag == "ATÍPICO POSITIVO DÍA"
 
 
 def test_sucursal_horaria_detecta_atipico_aunque_grupos_no_marcan(
@@ -363,5 +363,5 @@ def test_sucursal_horaria_detecta_atipico_aunque_grupos_no_marcan(
     assert all(r.atipico_grupo_horario is False for r in resultados)
     assert all(r.atipico_sucursal_horario is True for r in resultados)
 
-    assert principal.tag == "ATÍPICO POSITIVO"
-    assert filtrada.tag == "ATÍPICO POSITIVO"
+    assert principal.tag == "ATÍPICO POSITIVO HORA"
+    assert filtrada.tag == "ATÍPICO POSITIVO HORA"

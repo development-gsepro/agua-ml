@@ -22,6 +22,8 @@ MODEL_PATH = MODELS_DIR / "atipico_positivo.pkl"
 REPORT_DIR = DATA_DIR / "reportes_atipicos"
 
 TAG_ATIPICO_POSITIVO = "ATÍPICO POSITIVO"
+TAG_ATIPICO_POSITIVO_DIA = "ATÍPICO POSITIVO DÍA"
+TAG_ATIPICO_POSITIVO_HORA = "ATÍPICO POSITIVO HORA"
 TAG_SIN_CATEGORIZAR = "SIN CATEGORIZAR"
 MODEL_VERSION = 4
 
@@ -556,6 +558,28 @@ class ModeloAtipicosPositivos:
         _med, _mad, _q1, _q3, limite = self._estadisticas(referencia)
         return bool(valor > limite), limite, len(referencia)
 
+    def _valor_sucursal_diario_actual(self, consumo: ConsumoAgua) -> float:
+        clave = (int(consumo.idVBox), normalizar_grupo(consumo.Sucursal))
+        perfil = self.perfiles_sucursal_diarios.get(clave)
+        if perfil is None:
+            return 0.0
+        fecha_actual = _fecha_iso(consumo.Fecha)
+        for valor, fecha in perfil.observaciones:
+            if fecha == fecha_actual:
+                return float(valor)
+        return 0.0
+
+    def _valor_sucursal_horario_actual(self, consumo: ConsumoAgua) -> float:
+        clave = (int(consumo.idVBox), normalizar_grupo(consumo.Sucursal), _fecha_iso(consumo.Fecha))
+        perfil = self.perfiles_sucursal_horarios.get(clave)
+        if perfil is None:
+            return 0.0
+        hora_actual = int(consumo.hora)
+        for valor, hora in perfil.observaciones:
+            if int(hora) == hora_actual:
+                return float(valor)
+        return 0.0
+
     def evaluar(
         self,
         consumo: ConsumoAgua,
@@ -691,7 +715,21 @@ def generar_evidencia_atipicos_positivos(
     """Genera mapas CSV auditables, sin crear docenas de gráficas automáticas."""
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-    positivos = [r for r in resultados if r.es_atipico]
+    positivos_por_clave = {}
+
+    for resultado in resultados:
+        if not resultado.es_atipico:
+            continue
+
+        clave = clave_consumo(resultado.consumo)
+        anterior = positivos_por_clave.get(clave)
+
+        if anterior is None:
+            positivos_por_clave[clave] = resultado
+        elif resultado.atipico_diario and not anterior.atipico_diario:
+            positivos_por_clave[clave] = resultado
+
+    positivos = list(positivos_por_clave.values())
 
     detalle_path = REPORT_DIR / "detalle_atipicos_positivos.csv"
     columnas = [
@@ -813,98 +851,22 @@ def aplicar_modelo_atipicos_positivos(
     consumos: Iterable[ConsumoAgua],
     registros_db: dict,
     modelo: ModeloAtipicosPositivos,
-) -> tuple[list[int], list[int], list[ResultadoAtipicoPositivo]]:
+) -> tuple[dict[int, str], list[int], list[ResultadoAtipicoPositivo]]:
     """Evalúa solo registros que terminaron el flujo normal sin clasificación."""
-    ids_positivos: list[int] = []
+    tags_positivos: dict[int, str] = {}
     ids_vacios: list[int] = []
     resultados: list[ResultadoAtipicoPositivo] = []
-
-    # Materializamos porque necesitamos recorrer la corrida completa para
-    # calcular el consumo agregado de cada sucursal.
-    consumos = list(consumos)
-
-    # Una sola observación de consumoTotal por Area y día.
-    areas_diarias: dict[tuple[int, str, str, str], float] = {}
-
-    # Una sola observación de ConsumoHora por Area, día y hora.
-    areas_horarias: dict[tuple[int, str, str, str, int], float] = {}
-
-    for consumo in consumos:
-        if es_medidor_virtual(consumo.Area):
-            continue
-
-        try:
-            id_vbox = int(consumo.idVBox)
-            sucursal = normalizar_grupo(consumo.Sucursal)
-            area = normalizar_grupo(consumo.Area)
-            fecha = _fecha_iso(consumo.Fecha)
-            hora = int(consumo.hora)
-        except (TypeError, ValueError, OverflowError):
-            continue
-
-        if not sucursal or not area:
-            continue
-
-        try:
-            total = float(consumo.consumoTotal or 0)
-        except (TypeError, ValueError, OverflowError):
-            total = 0.0
-
-        if np.isfinite(total) and total > 0:
-            areas_diarias.setdefault(
-                (id_vbox, sucursal, area, fecha),
-                total,
-            )
-
-        try:
-            valor_hora = float(consumo.ConsumoHora or 0)
-        except (TypeError, ValueError, OverflowError):
-            valor_hora = 0.0
-
-        if np.isfinite(valor_hora) and valor_hora > 0:
-            areas_horarias.setdefault(
-                (id_vbox, sucursal, area, fecha, hora),
-                valor_hora,
-            )
-
-    sucursal_diaria: dict[tuple[int, str, str], float] = {}
-    for (
-        id_vbox,
-        sucursal,
-        _area,
-        fecha,
-    ), valor in areas_diarias.items():
-        clave = (id_vbox, sucursal, fecha)
-        sucursal_diaria[clave] = sucursal_diaria.get(clave, 0.0) + valor
-
-    sucursal_horaria: dict[tuple[int, str, str, int], float] = {}
-    for (
-        id_vbox,
-        sucursal,
-        _area,
-        fecha,
-        hora,
-    ), valor in areas_horarias.items():
-        clave = (id_vbox, sucursal, fecha, hora)
-        sucursal_horaria[clave] = sucursal_horaria.get(clave, 0.0) + valor
 
     for consumo in consumos:
         if not es_candidato(consumo):
             continue
 
         try:
-            clave_sd = (
-                int(consumo.idVBox),
-                normalizar_grupo(consumo.Sucursal),
-                _fecha_iso(consumo.Fecha),
-            )
-            clave_sh = (*clave_sd, int(consumo.hora))
+            valor_sd = modelo._valor_sucursal_diario_actual(consumo)
+            valor_sh = modelo._valor_sucursal_horario_actual(consumo)
         except (TypeError, ValueError, OverflowError):
-            clave_sd = None
-            clave_sh = None
-
-        valor_sd = sucursal_diaria.get(clave_sd, 0.0) if clave_sd else 0.0
-        valor_sh = sucursal_horaria.get(clave_sh, 0.0) if clave_sh else 0.0
+            valor_sd = 0.0
+            valor_sh = 0.0
 
         resultado = modelo.evaluar(
             consumo,
@@ -918,11 +880,56 @@ def aplicar_modelo_atipicos_positivos(
             continue
 
         if resultado.es_atipico:
-            consumo.tag = TAG_ATIPICO_POSITIVO
-            ids_positivos.append(registro.id)
+            # DÍA tiene prioridad. La validación horaria se usa cuando
+            # el registro no resultó atípico por día.
+            if resultado.atipico_diario:
+                tag_positivo = TAG_ATIPICO_POSITIVO_DIA
+            else:
+                tag_positivo = TAG_ATIPICO_POSITIVO_HORA
+
+            # Si el mismo ID aparece varias veces por duplicados de MSSQL,
+            # conservar DÍA si alguna evaluación diaria fue positiva.
+            tag_anterior = tags_positivos.get(registro.id)
+            if (
+                tag_anterior == TAG_ATIPICO_POSITIVO_DIA
+                or tag_positivo == TAG_ATIPICO_POSITIVO_DIA
+            ):
+                tags_positivos[registro.id] = TAG_ATIPICO_POSITIVO_DIA
+            else:
+                tags_positivos[registro.id] = TAG_ATIPICO_POSITIVO_HORA
+
+            consumo.tag = tags_positivos[registro.id]
         else:
             consumo.tag = ""
             ids_vacios.append(registro.id)
 
+    positivos_unicos = set(tags_positivos)
+    vacios_unicos = set(ids_vacios)
+    conflicto = positivos_unicos & vacios_unicos
+
+    # Un positivo nunca puede borrarse posteriormente como vacío.
+    ids_vacios_finales = sorted(vacios_unicos - positivos_unicos)
+
+    print(
+        "[ATÍPICO POSITIVO] IDs positivos únicos: "
+        f"{len(positivos_unicos)}"
+    )
+    print(
+        "[ATÍPICO POSITIVO] DÍA: "
+        f"{sum(tag == TAG_ATIPICO_POSITIVO_DIA for tag in tags_positivos.values())}"
+    )
+    print(
+        "[ATÍPICO POSITIVO] HORA: "
+        f"{sum(tag == TAG_ATIPICO_POSITIVO_HORA for tag in tags_positivos.values())}"
+    )
+    print(
+        "[ATÍPICO POSITIVO] IDs presentes en positivos Y vacíos antes de depurar: "
+        f"{len(conflicto)}"
+    )
+    print(
+        "[ATÍPICO POSITIVO] IDs vacíos finales: "
+        f"{len(ids_vacios_finales)}"
+    )
+
     generar_evidencia_atipicos_positivos(resultados, modelo)
-    return ids_positivos, ids_vacios, resultados
+    return tags_positivos, ids_vacios_finales, resultados

@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import time
+import gc
 
 from .models.consumo import ConsumoAgua, es_medidor_virtual
 from .repositories.postgres_repository import (
@@ -67,6 +68,8 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     if df_entrenamiento.empty:
         print("[ENTRENAMIENTO] Sin histórico disponible; se crea modelo vacío.")
     modelo_atipicos = entrenar_y_guardar_modelo(df_entrenamiento)
+    del df_entrenamiento
+    gc.collect()
     print(
         f"[ENTRENAMIENTO] PKL actualizado: {MODEL_PATH} | "
         f"perfiles diarios: {len(modelo_atipicos.perfiles_diarios)} | "
@@ -165,14 +168,26 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     print("\n[POSTGRES] MARCANDO SIN CATEGORIZAR")
     ids = preparar_sin_categorizar(consumos, registros_db)
     actualizar_sin_categorizar(ids)
+    del ids
+
+    # Estas estructuras ya no se necesitan para atípicos positivos y pueden
+    # ocupar varios GB durante una ejecución mensual.
+    if claves_medidores:
+        del historico
+        del historico_por_medidor
+        del grupos_todos
+        del actualizador
+    del grupos
+    gc.collect()
+    print("[MEMORIA] Estructuras del clasificador normal liberadas.")
 
     print("\n[7/7] EVALUANDO ATÍPICOS POSITIVOS")
-    ids_positivos, ids_vacios, resultados_atipicos = (
+    tags_positivos, ids_vacios, resultados_atipicos = (
         aplicar_modelo_atipicos_positivos(
             consumos, registros_db, modelo_atipicos
         )
     )
-    actualizar_tags_atipicos_positivos(ids_positivos, ids_vacios)
+    actualizar_tags_atipicos_positivos(tags_positivos, ids_vacios)
     con_perfil = sum(r.tiene_perfil for r in resultados_atipicos)
     diarios = sum(r.atipico_diario for r in resultados_atipicos)
     horarios = sum(r.atipico_horario for r in resultados_atipicos)
@@ -182,12 +197,14 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     )
     print(
         f"[ATÍPICO POSITIVO] Candidatos: {len(resultados_atipicos)} | "
-        f"con perfil: {con_perfil} | positivos: {len(ids_positivos)} | "
+        f"con perfil: {con_perfil} | positivos únicos: {len(tags_positivos)} | "
         f"vacíos: {len(ids_vacios)}"
     )
     print(
-        f"[ATÍPICO POSITIVO] Diario: {diarios} | "
-        f"Horario: {horarios} | Ambos: {ambos}"
+        f"[ATÍPICO POSITIVO] DÍA: "
+        f"{sum(tag == TAG_ATIPICO_POSITIVO_DIA for tag in tags_positivos.values())} | "
+        f"HORA: "
+        f"{sum(tag == TAG_ATIPICO_POSITIVO_HORA for tag in tags_positivos.values())}"
     )
 
     verificar_sincronizacion(consumos, registros_db)
@@ -197,6 +214,11 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
         clave_consumo(consumo): consumo
         for consumo in consumos
     }
+
+    for clave, registro in registros_db.items():
+        tag_positivo = tags_positivos.get(registro.id)
+        if tag_positivo and clave in consumos_unicos:
+            consumos_unicos[clave].tag = tag_positivo
 
     conteo_tags = {}
     for consumo in consumos_unicos.values():

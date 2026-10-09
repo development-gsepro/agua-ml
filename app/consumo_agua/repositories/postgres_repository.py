@@ -96,44 +96,144 @@ def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
     return resultado
 
 
-def obtener_historico_postgres(grupos: set, fecha_inicio: date, fecha_fin: date) -> dict:
+def obtener_historico_postgres(
+    grupos: set,
+    fecha_inicio: date,
+    fecha_fin: date,
+) -> dict:
     if not grupos:
         return {}
+
     valores = list(grupos)
     placeholders = ", ".join(["(%s,%s)"] * len(valores))
-    query = f'''
+
+    query = f"""
         WITH grupos(id_vbox, medidor) AS (VALUES {placeholders})
-        SELECT c.id, c."idVBox", c."Sucursal", c."NombreMedidor",
-               c."Formato", c."Mercado", c."Campo", c.tipo, c."M2",
-               c."Fecha", c."consumoTotal", c.hora, c."ConsumoHora",
-               c.tag, c.categoria, c.setpoint_agua, c."Cliente", c."Area",
-               c."Ciudad"
+        SELECT DISTINCT ON (
+            c."idVBox",
+            regexp_replace(
+                regexp_replace(
+                    UPPER(TRIM(COALESCE(c."Area", ''))),
+                    '\\s+',
+                    ' ',
+                    'g'
+                ),
+                '^[ .]+|[ .]+$',
+                '',
+                'g'
+            ),
+            c."Fecha"::date,
+            c.hora
+        )
+            c.id,
+            c."idVBox",
+            c."Sucursal",
+            c."NombreMedidor",
+            c."Formato",
+            c."Mercado",
+            c."Campo",
+            c.tipo,
+            c."M2",
+            c."Fecha",
+            c."consumoTotal",
+            c.hora,
+            c."ConsumoHora",
+            c.tag,
+            c.categoria,
+            c.setpoint_agua,
+            c."Cliente",
+            c."Area",
+            c."Ciudad"
         FROM public.consumo_agua c
         INNER JOIN grupos g
             ON c."idVBox" = g.id_vbox
             AND (
-                regexp_replace(regexp_replace(UPPER(TRIM(COALESCE(c."Area", ''))), '\\s+', ' ', 'g'), '^[ .]+|[ .]+$', '', 'g') = g.medidor
+                regexp_replace(
+                    regexp_replace(
+                        UPPER(TRIM(COALESCE(c."Area", ''))),
+                        '\\s+',
+                        ' ',
+                        'g'
+                    ),
+                    '^[ .]+|[ .]+$',
+                    '',
+                    'g'
+                ) = g.medidor
                 OR
-                regexp_replace(regexp_replace(UPPER(TRIM(COALESCE(c."NombreMedidor", ''))), '\\s+', ' ', 'g'), '^[ .]+|[ .]+$', '', 'g') = g.medidor
+                regexp_replace(
+                    regexp_replace(
+                        UPPER(TRIM(COALESCE(c."NombreMedidor", ''))),
+                        '\\s+',
+                        ' ',
+                        'g'
+                    ),
+                    '^[ .]+|[ .]+$',
+                    '',
+                    'g'
+                ) = g.medidor
             )
-        WHERE c."Fecha" >= %s AND c."Fecha" < %s
-    '''
+        WHERE c."Fecha" >= %s
+          AND c."Fecha" < %s
+        ORDER BY
+            c."idVBox",
+            regexp_replace(
+                regexp_replace(
+                    UPPER(TRIM(COALESCE(c."Area", ''))),
+                    '\\s+',
+                    ' ',
+                    'g'
+                ),
+                '^[ .]+|[ .]+$',
+                '',
+                'g'
+            ),
+            c."Fecha"::date,
+            c.hora,
+            c.id DESC
+    """
+
     parametros = []
     for id_vbox, medidor in valores:
         parametros.extend([id_vbox, medidor])
-    parametros.extend([fecha_inicio, fecha_fin + timedelta(days=1)])
-    print(f"[POSTGRES] Cargando histórico {fecha_inicio} -> {fecha_fin}...")
+
+    parametros.extend([
+        fecha_inicio,
+        fecha_fin + timedelta(days=1),
+    ])
+
+    print(
+        f"[POSTGRES] Cargando histórico "
+        f"{fecha_inicio} -> {fecha_fin}..."
+    )
+
     inicio = time.perf_counter()
-    with get_conn() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query, parametros)
-            rows = cursor.fetchall()
     resultado = {}
-    for row in rows:
-        registro = row_a_consumo_db(row)
-        resultado[clave_consumo(registro.consumo)] = registro
+
+    with get_conn() as conn:
+        with conn.cursor(name="historico_consumo_agua") as cursor:
+            cursor.itersize = BATCH_SIZE
+            cursor.execute(query, parametros)
+
+            procesados = 0
+
+            for row in cursor:
+                registro = row_a_consumo_db(row)
+                resultado[clave_consumo(registro.consumo)] = registro
+                procesados += 1
+
+                if procesados % 100000 == 0:
+                    print(
+                        f"[POSTGRES] Histórico procesado: "
+                        f"{procesados}"
+                    )
+
     segundos = time.perf_counter() - inicio
-    print(f"[POSTGRES] Histórico: {len(resultado)} registros ({segundos:.2f}s)")
+
+    print(
+        f"[POSTGRES] Histórico: "
+        f"{len(resultado)} registros ({segundos:.2f}s)"
+    )
+
     return resultado
 
 
