@@ -8,10 +8,13 @@ from app.consumo_agua.services.clasificacion import (
     evaluar_fugas,
     preparar_sin_categorizar,
 )
+from app.consumo_agua.services import atipicos_positivos as servicio_atipicos
 from app.consumo_agua.services.atipicos_positivos import (
     ModeloAtipicosPositivos,
+    aplicar_modelo_atipicos_positivos,
     es_candidato,
 )
+from app.consumo_agua.utils.normalizacion import clave_consumo
 
 
 class ActualizadorFake:
@@ -152,3 +155,87 @@ def test_modelo_atipicos_excluye_areas_virtuales():
     modelo = ModeloAtipicosPositivos(7).entrenar(pd.DataFrame(filas))
     assert modelo.perfiles_diarios == {}
     assert modelo.perfiles_horarios == {}
+
+
+def test_fuga_reparada_no_permite_consumo_total_cero():
+    dias = dias_con_totales([150, 50, 50, 50, 0])
+    act = ActualizadorFake()
+    evaluar_fuga_reparada(dias, act)
+    assert act.actualizaciones == {}
+
+
+def test_atipico_positivo_no_acepta_consumo_total_cero():
+    fecha = datetime(2026, 9, 8)
+    c = consumo(fecha, 8, 0, 10)
+    c.tag = "SIN CATEGORIZAR"
+    c.categoria = ""
+    assert es_candidato(c) is False
+
+
+def test_atipico_positivo_no_acepta_consumo_total_menos_uno():
+    fecha = datetime(2026, 9, 8)
+    c = consumo(fecha, 8, -1, 10)
+    c.tag = "SIN CATEGORIZAR"
+    c.categoria = ""
+    assert es_candidato(c) is False
+
+
+
+
+def test_consumo_total_cero_es_atipico():
+    from app.consumo_agua.consumo_agua import clasificar_consumo_inicial
+
+    c = consumo(datetime(2026, 9, 1), 8, 0, 0)
+    estado = clasificar_consumo_inicial(c)
+
+    assert estado == "atipico"
+    assert c.tag == "ATÍPICO"
+
+
+def test_consumo_total_menos_uno_es_medidor_offline():
+    from app.consumo_agua.consumo_agua import clasificar_consumo_inicial
+
+    c = consumo(datetime(2026, 9, 1), 8, -1, 0)
+    estado = clasificar_consumo_inicial(c)
+
+    assert estado == "offline"
+    assert c.tag == "MEDIDOR OFFLINE"
+
+
+def test_consumo_total_positivo_permanece_sin_etiqueta_inicial():
+    from app.consumo_agua.consumo_agua import clasificar_consumo_inicial
+
+    c = consumo(datetime(2026, 9, 1), 8, 10, 4)
+    estado = clasificar_consumo_inicial(c)
+
+    assert estado == "valido"
+    assert c.tag == ""
+
+
+def test_consumo_hora_cero_puede_ser_candidato_si_total_es_positivo():
+    fecha = datetime(2026, 9, 8)
+    c = consumo(fecha, 8, 100, 0)
+    c.tag = "SIN CATEGORIZAR"
+    c.categoria = ""
+
+    assert es_candidato(c) is True
+
+
+def test_registro_representativo_prefiere_consumo_total_positivo():
+    from app.consumo_agua.repositories.postgres_repository import (
+        seleccionar_registro_representativo,
+    )
+
+    fecha = datetime(2026, 9, 13)
+
+    cero = ConsumoDB(
+        1,
+        consumo(fecha, 14, 0, 0),
+    )
+    positivo = ConsumoDB(
+        2,
+        consumo(fecha, 14, 11.36, 3.79),
+    )
+
+    assert seleccionar_registro_representativo(cero, positivo).id == 2
+    assert seleccionar_registro_representativo(positivo, cero).id == 2

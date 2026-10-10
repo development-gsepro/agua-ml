@@ -703,6 +703,8 @@ def entrenar_y_guardar_modelo(
 def es_candidato(consumo: ConsumoAgua) -> bool:
     if es_medidor_virtual(consumo.Area):
         return False
+    if float(consumo.consumoTotal or 0) <= 0:
+        return False
     tag = str(consumo.tag or "").strip().upper()
     categoria = str(consumo.categoria or "").strip()
     return tag in {"", TAG_SIN_CATEGORIZAR} and categoria == ""
@@ -880,8 +882,6 @@ def aplicar_modelo_atipicos_positivos(
             continue
 
         if resultado.es_atipico:
-            # DÍA tiene prioridad. La validación horaria se usa cuando
-            # el registro no resultó atípico por día.
             if resultado.atipico_diario:
                 tag_positivo = TAG_ATIPICO_POSITIVO_DIA
             else:

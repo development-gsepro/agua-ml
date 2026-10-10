@@ -45,6 +45,25 @@ def row_a_consumo_db(row) -> ConsumoDB:
     return ConsumoDB(id=row[0], consumo=consumo)
 
 
+
+def seleccionar_registro_representativo(
+    actual: ConsumoDB | None,
+    nuevo: ConsumoDB,
+) -> ConsumoDB:
+    if actual is None:
+        return nuevo
+
+    total_actual = float(actual.consumo.consumoTotal or 0)
+    total_nuevo = float(nuevo.consumo.consumoTotal or 0)
+
+    if total_nuevo > 0 and total_actual <= 0:
+        return nuevo
+
+    if total_actual > 0 and total_nuevo <= 0:
+        return actual
+
+    return nuevo
+
 def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
     if not consumos:
         return {}
@@ -85,8 +104,14 @@ def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
                         f"{len(lote)} enviados / {len(rows)} IDs"
                     )
                 for consumo, row in zip(lote, rows):
-                    resultado[clave_consumo(consumo)] = ConsumoDB(
-                        id=row[0], consumo=consumo
+                    clave = clave_consumo(consumo)
+                    registro = ConsumoDB(
+                        id=row[0],
+                        consumo=consumo,
+                    )
+                    resultado[clave] = seleccionar_registro_representativo(
+                        resultado.get(clave),
+                        registro,
                     )
                 insertados += len(lote)
                 print(f"[POSTGRES] {insertados}/{len(consumos)} insertados")

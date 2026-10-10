@@ -35,18 +35,73 @@ from .services.atipicos_positivos import (
     TAG_ATIPICO_POSITIVO_DIA,
     TAG_ATIPICO_POSITIVO_HORA,
 )
-from .utils.normalizacion import clave_consumo, clave_medidor, normalizar_medidor
+from .utils.normalizacion import clave_consumo, clave_medidor
 
 DIAS_HISTORICO = 10
-EXCEPCION_MEDIDORES = {
-    normalizar_medidor(x)
-    for x in (
-        "AGUA PRINCIPAL", "AGUA PRINCIPAL*", "CONSUMO DE AGUA",
-        "CONSUMO DE AGUA GRAL", "CONSUMO DE AGUA GRAL.",
-        "AGUA POTABLE", "AGUA FILTRADA",
-    )
-}
 
+
+def clasificar_consumo_inicial(consumo: ConsumoAgua) -> str | None:
+    if es_medidor_virtual(consumo.Area):
+        return None
+
+    total = float(consumo.consumoTotal or 0)
+
+    if total == -1:
+        consumo.tag = "MEDIDOR OFFLINE"
+        consumo.categoria = f"{total}"
+        return "offline"
+
+    if total == 0:
+        consumo.tag = "ATÍPICO"
+        consumo.categoria = f"{total}"
+        return "atipico"
+
+    if total < 0:
+        return "invalido"
+
+    return "valido"
+
+
+
+def validar_reglas_finales(consumos: list[ConsumoAgua]) -> dict[str, int]:
+    errores = {
+        "ATÍPICO": 0,
+        "MEDIDOR OFFLINE": 0,
+        "MEDIDOR SIN AGUA": 0,
+        "FUGA REPARADA": 0,
+        "ATÍPICO POSITIVO DÍA": 0,
+        "ATÍPICO POSITIVO HORA": 0,
+        "VACÍO": 0,
+        "CONSUMO HORA -1": 0,
+    }
+
+    for consumo in consumos:
+        if es_medidor_virtual(consumo.Area):
+            continue
+
+        total = float(consumo.consumoTotal or 0)
+        hora = float(consumo.ConsumoHora or 0)
+        tag = str(consumo.tag or "").strip()
+
+        if hora == -1:
+            errores["CONSUMO HORA -1"] += 1
+
+        if tag == "ATÍPICO" and total != 0:
+            errores["ATÍPICO"] += 1
+        elif tag == "MEDIDOR OFFLINE" and total != -1:
+            errores["MEDIDOR OFFLINE"] += 1
+        elif tag == "MEDIDOR SIN AGUA" and total != 0:
+            errores["MEDIDOR SIN AGUA"] += 1
+        elif tag == "FUGA REPARADA" and total <= 0:
+            errores["FUGA REPARADA"] += 1
+        elif tag == TAG_ATIPICO_POSITIVO_DIA and total <= 0:
+            errores["ATÍPICO POSITIVO DÍA"] += 1
+        elif tag == TAG_ATIPICO_POSITIVO_HORA and total <= 0:
+            errores["ATÍPICO POSITIVO HORA"] += 1
+        elif tag == "" and total <= 0:
+            errores["VACÍO"] += 1
+
+    return errores
 
 def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     inicio_total = time.perf_counter()
@@ -89,20 +144,15 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     atipicos = 0
     offline = 0
     for consumo in consumos:
-        if es_medidor_virtual(consumo.Area):
+        estado = clasificar_consumo_inicial(consumo)
+
+        if estado is None:
             continue
-        total = float(consumo.consumoTotal or 0)
-        medidor = normalizar_medidor(consumo.Area)
-        if total in (-1, -2):
-            consumo.tag = "MEDIDOR OFFLINE"
-            consumo.categoria = f"{total}"
+        if estado == "offline":
             offline += 1
-        elif ((total == 0 and medidor in EXCEPCION_MEDIDORES) or total < -2):
-            consumo.tag = "ATÍPICO"
-            consumo.categoria = f"{total}"
+        elif estado == "atipico":
             atipicos += 1
-            historicos.append(consumo)
-        else:
+        elif estado == "valido":
             historicos.append(consumo)
     print(f"[2/7] OFFLINE: {offline}")
     print(f"[2/7] ATÍPICO: {atipicos}")
@@ -213,8 +263,8 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
 
     tiempo_total = time.perf_counter() - inicio_total
     consumos_unicos = {
-        clave_consumo(consumo): consumo
-        for consumo in consumos
+        clave: registro.consumo
+        for clave, registro in registros_db.items()
     }
 
     for clave, registro in registros_db.items():
@@ -226,6 +276,16 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     for consumo in consumos_unicos.values():
         tag = consumo.tag or "VACÍO"
         conteo_tags[tag] = conteo_tags.get(tag, 0) + 1
+    errores_reglas = validar_reglas_finales(
+        list(consumos_unicos.values())
+    )
+
+    print("\n" + "=" * 70)
+    print("VALIDACIÓN DE REGLAS")
+    print("=" * 70)
+    for regla, errores in errores_reglas.items():
+        print(f"{regla}: {errores} inválidos")
+
     print("\n" + "#" * 70)
     print("CLASIFICACIÓN FINALIZADA")
     print("#" * 70)

@@ -104,6 +104,9 @@ def evaluar_fuga_reparada(
 
         ventana_reparacion = [dias[f] for f in posteriores]
 
+        if any(dia.consumo_total <= 0 for dia in ventana_reparacion):
+            continue
+
         # Los cuatro días deben estar estrictamente debajo del SP.
         # Si alguno cumple o supera el SP, se rompe la secuencia.
         if any(dia.supera_sp for dia in ventana_reparacion):
