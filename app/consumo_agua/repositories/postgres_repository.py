@@ -316,9 +316,14 @@ def actualizar_sin_categorizar(ids: list[int]) -> None:
 def limpiar_tags_periodo(fecha_inicio, fecha_fin) -> None:
     query = '''
         UPDATE public.consumo_agua
-        SET tag = ''
+        SET tag = CASE
+            WHEN "consumoTotal" = -1 THEN 'MEDIDOR OFFLINE'
+            WHEN "consumoTotal" = 0 THEN 'ATÍPICO'
+            ELSE ''
+        END
         WHERE "Fecha" >= %s
-           AND "Fecha" < (%s::date + INTERVAL '1 day')    '''
+          AND "Fecha" < (%s::date + INTERVAL '1 day')
+    '''
 
     with get_conn() as conn:
         with conn.cursor() as cursor:
@@ -326,5 +331,5 @@ def limpiar_tags_periodo(fecha_inicio, fecha_fin) -> None:
             afectados = cursor.rowcount
         conn.commit()
 
-    print(f"[POSTGRES] Tags limpiados para el periodo: {afectados}")
+    print(f"[POSTGRES] Tags reiniciados para el periodo: {afectados}")
 
