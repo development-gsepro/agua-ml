@@ -71,6 +71,7 @@ def validar_reglas_finales(consumos: list[ConsumoAgua]) -> dict[str, int]:
         "FUGA REPARADA": 0,
         "ATÍPICO POSITIVO DÍA": 0,
         "ATÍPICO POSITIVO HORA": 0,
+        "ATÍPICO BAJO DÍA": 0,
         "VACÍO": 0,
         "CONSUMO HORA -1": 0,
     }
@@ -98,6 +99,8 @@ def validar_reglas_finales(consumos: list[ConsumoAgua]) -> dict[str, int]:
             errores["ATÍPICO POSITIVO DÍA"] += 1
         elif tag == TAG_ATIPICO_POSITIVO_HORA and total <= 0:
             errores["ATÍPICO POSITIVO HORA"] += 1
+        elif tag == "ATÍPICO BAJO DÍA" and total <= 0:
+            errores["ATÍPICO BAJO DÍA"] += 1
         elif tag == "" and total <= 0:
             errores["VACÍO"] += 1
 

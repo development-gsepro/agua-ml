@@ -108,7 +108,7 @@ def test_tipo_dia_no_forma_parte_del_modelo():
     df["tipo"] = ["ENTRE_SEMANA" if i % 2 else "FIN_SEMANA" for i in range(len(df))]
     modelo = ModeloAtipicosPositivos(7).entrenar(df)
     assert len(modelo.perfiles_diarios) == 1
-    assert len(modelo.perfiles_horarios) == 8
+    assert len(modelo.perfiles_horarios) == 10
 
 
 def test_aplicacion_respeta_candidatos(tmp_path, monkeypatch):
@@ -135,7 +135,7 @@ def test_aplicacion_respeta_candidatos(tmp_path, monkeypatch):
     assert positivo.tag == "ATÍPICO POSITIVO HORA"
     assert normal.tag == ""
     assert protegido.tag == "FUGA ACTIVA"
-    assert len(resultados) == 2
+    assert len(resultados) == 3
 
 
 def test_modelo_pkl_roundtrip(tmp_path):
@@ -246,8 +246,14 @@ def _dataset_sucursal_horaria(fecha_objetivo):
                     valor_a = float((hora + 1) * 10)
                     valor_b = float(110 - valor_a)
             else:
-                valor_a = 50.0
-                valor_b = 60.0
+                if hora == 8:
+                    valores_hora_8_a = [30, 40, 50, 60, 70, 80, 90]
+                    valores_hora_8_b = [80, 70, 60, 50, 40, 30, 20]
+                    valor_a = float(valores_hora_8_a[d])
+                    valor_b = float(valores_hora_8_b[d])
+                else:
+                    valor_a = 50.0
+                    valor_b = 60.0
 
             for area, total, valor_hora in (
                 (
@@ -311,17 +317,18 @@ def test_sucursal_diaria_detecta_atipico_aunque_grupos_no_marcan(
         modelo,
     )
 
-    assert set(ids_pos) == {1, 2}
-    assert ids_vacios == []
+    assert not ids_pos
+    assert set(ids_vacios) == {1, 2}
 
     assert all(r.atipico_grupo_diario is False for r in resultados)
     assert all(r.atipico_sucursal_diario is True for r in resultados)
+    assert all(r.atipico_diario is False for r in resultados)
 
-    assert principal.tag == "ATÍPICO POSITIVO DÍA"
-    assert filtrada.tag == "ATÍPICO POSITIVO DÍA"
+    assert principal.tag == ""
+    assert filtrada.tag == ""
 
 
-def test_sucursal_horaria_detecta_atipico_aunque_grupos_no_marcan(
+def test_sucursal_horaria_no_etiqueta_si_grupos_no_marcan(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(
@@ -354,14 +361,225 @@ def test_sucursal_horaria_detecta_atipico_aunque_grupos_no_marcan(
         modelo,
     )
 
-    assert set(ids_pos) == {1, 2}
-    assert ids_vacios == []
+    assert not ids_pos
+    assert set(ids_vacios) == {1, 2}
 
     assert all(r.atipico_grupo_diario is False for r in resultados)
     assert all(r.atipico_sucursal_diario is False for r in resultados)
 
     assert all(r.atipico_grupo_horario is False for r in resultados)
     assert all(r.atipico_sucursal_horario is True for r in resultados)
+    assert all(r.atipico_horario is False for r in resultados)
 
-    assert principal.tag == "ATÍPICO POSITIVO HORA"
-    assert filtrada.tag == "ATÍPICO POSITIVO HORA"
+    assert principal.tag == ""
+    assert filtrada.tag == ""
+
+
+def test_dia_atipico_bajo():
+    fecha = datetime(2026, 9, 8)
+
+    modelo = ModeloAtipicosPositivos(7).entrenar(
+        _dataset(
+            fecha,
+            total_objetivo=20,
+            hora_objetivo=10,
+        )
+    )
+
+    r = modelo.evaluar(
+        _consumo(20, 10, fecha, hora=8)
+    )
+
+    assert r.atipico_diario is True
+    assert r.direccion_diaria == "BAJO"
+    assert r.limite_inferior_diario == 100.0
+    assert r.limite_diario == 100.0
+
+
+def test_dia_atipico_alto_indica_direccion():
+    fecha = datetime(2026, 9, 8)
+
+    modelo = ModeloAtipicosPositivos(7).entrenar(
+        _dataset(
+            fecha,
+            total_objetivo=500,
+            hora_objetivo=10,
+        )
+    )
+
+    r = modelo.evaluar(
+        _consumo(500, 10, fecha, hora=8)
+    )
+
+    assert r.atipico_diario is True
+    assert r.direccion_diaria == "ALTO"
+    assert r.limite_inferior_diario == 100.0
+    assert r.limite_diario == 100.0
+
+
+def test_consumo_cero_no_se_clasifica_como_atipico_bajo():
+    fecha = datetime(2026, 9, 8)
+
+    modelo = ModeloAtipicosPositivos(7).entrenar(
+        _dataset(
+            fecha,
+            total_objetivo=100,
+            hora_objetivo=10,
+        )
+    )
+
+    r = modelo.evaluar(
+        _consumo(0, 10, fecha, hora=8)
+    )
+
+    assert r.atipico_diario is False
+    assert r.direccion_diaria is None
+    assert r.es_atipico is False
+
+
+def test_aplicacion_asigna_tag_atipico_bajo_dia(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        servicio_atipicos,
+        "REPORT_DIR",
+        tmp_path / "reporte",
+    )
+
+    fecha = datetime(2026, 9, 8)
+
+    modelo = ModeloAtipicosPositivos(7).entrenar(
+        _dataset(
+            fecha,
+            total_objetivo=20,
+            hora_objetivo=10,
+        )
+    )
+
+    consumo = _consumo(
+        20,
+        10,
+        fecha,
+        hora=8,
+    )
+
+    registros = {
+        clave_consumo(consumo): ConsumoDB(
+            1,
+            consumo,
+        )
+    }
+
+    tags, ids_vacios, resultados = (
+        aplicar_modelo_atipicos_positivos(
+            [consumo],
+            registros,
+            modelo,
+        )
+    )
+
+    assert tags == {
+        1: "ATÍPICO BAJO DÍA"
+    }
+    assert ids_vacios == []
+    assert consumo.tag == "ATÍPICO BAJO DÍA"
+    assert resultados[0].direccion_diaria == "BAJO"
+
+
+def test_bodega_san_miguel_29_normal_30_alto():
+    filas = []
+
+    valores = {
+        8: 1613.85,
+        9: 5567.88,
+        10: 5658.91,
+        11: 5658.91,
+        12: 5658.91,
+        13: 5186.11,
+        14: 5595.63,
+        15: 5952.74,
+        16: 5748.80,
+        17: 6548.55,
+        18: 8463.79,
+        19: 8063.98,
+        20: 7082.14,
+        24: 5719.97,
+        25: 5719.97,
+        26: 5719.97,
+        27: 5719.96,
+        28: 5721.20,
+        29: 6200.00,
+        30: 9745.92,
+    }
+
+    for dia, total in valores.items():
+        fecha = datetime(2026, 9, dia)
+
+        for hora in range(10):
+            filas.append({
+                "idVBox": 5700,
+                "Sucursal": "3628 BODEGA SAN MIGUEL",
+                "Cliente": "CLIENTE PRUEBA",
+                "Ciudad": "CIUDAD PRUEBA",
+                "Area": "Suministro",
+                "Fecha": fecha,
+                "consumoTotal": total,
+                "hora": hora,
+                "ConsumoHora": 10.0,
+                "tag": "",
+                "categoria": "",
+            })
+
+    modelo = ModeloAtipicosPositivos(7).entrenar(
+        pd.DataFrame(filas)
+    )
+
+    consumo_29 = ConsumoAgua(
+        idVBox=5700,
+        Sucursal="3628 BODEGA SAN MIGUEL",
+        Cliente="CLIENTE PRUEBA",
+        Area="Suministro",
+        NombreMedidor="Medidor",
+        Ciudad="CIUDAD PRUEBA",
+        Formato="",
+        Mercado="",
+        Campo="",
+        tipo="Invasivo",
+        M2=100.0,
+        Fecha=datetime(2026, 9, 29),
+        consumoTotal=6200.0,
+        hora=8,
+        ConsumoHora=10.0,
+        tag="SIN CATEGORIZAR",
+        categoria="",
+    )
+
+    consumo_30 = ConsumoAgua(
+        idVBox=5700,
+        Sucursal="3628 BODEGA SAN MIGUEL",
+        Cliente="CLIENTE PRUEBA",
+        Area="Suministro",
+        NombreMedidor="Medidor",
+        Ciudad="CIUDAD PRUEBA",
+        Formato="",
+        Mercado="",
+        Campo="",
+        tipo="Invasivo",
+        M2=100.0,
+        Fecha=datetime(2026, 9, 30),
+        consumoTotal=9745.92,
+        hora=8,
+        ConsumoHora=10.0,
+        tag="SIN CATEGORIZAR",
+        categoria="",
+    )
+
+    r29 = modelo.evaluar(consumo_29)
+    r30 = modelo.evaluar(consumo_30)
+
+    assert r29.atipico_diario is False
+    assert r29.direccion_diaria is None
+
+    assert r30.atipico_diario is True
+    assert r30.direccion_diaria == "ALTO"
