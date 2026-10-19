@@ -10,7 +10,10 @@ from .repositories.postgres_repository import (
     obtener_historico_postgres,
     limpiar_tags_periodo,
 )
-from .repositories.atipicos_repository import actualizar_tags_atipicos_positivos
+from .repositories.atipicos_repository import (
+    actualizar_tags_atipicos_positivos,
+    actualizar_metricas_atipicos,
+)
 from .services.clasificacion import (
     agrupar_por_dia,
     evaluar_consumo_elevado,
@@ -243,6 +246,13 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
         )
     )
     actualizar_tags_atipicos_positivos(tags_positivos, ids_vacios)
+    print("\n[POSTGRES] GUARDANDO MÉTRICAS DE ATÍPICOS")
+
+    actualizar_metricas_atipicos(
+        resultados_atipicos,
+        registros_db,
+        modelo_atipicos,
+    )
     con_perfil = sum(r.tiene_perfil for r in resultados_atipicos)
     diarios = sum(r.atipico_diario for r in resultados_atipicos)
     horarios = sum(r.atipico_horario for r in resultados_atipicos)
