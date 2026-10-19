@@ -1,3 +1,6 @@
+import time
+
+from psycopg2.extras import execute_values
 from ...shared.database.databasePostgress import get_connection as get_conn
 from ..utils.normalizacion import clave_consumo
 
@@ -53,20 +56,20 @@ def actualizar_metricas_atipicos(
     resultados,
     registros_db: dict,
     modelo,
+    batch_size: int = 5000,
 ) -> None:
     """
-    Guarda en PostgreSQL el resultado del modelo de atípicos:
+    Guarda por lotes las métricas calculadas por el modelo:
 
     - atipico_dia
     - idoneo_dia
     - atipico_hora
     - idoneo_hora
-
-    El valor idóneo corresponde a la mediana histórica del perfil
-    diario u horario del mismo medidor/área.
     """
 
-    valores = []
+    inicio = time.perf_counter()
+
+    por_id = {}
 
     for resultado in resultados:
         consumo = resultado.consumo
@@ -93,40 +96,94 @@ def actualizar_metricas_atipicos(
             else None
         )
 
-        valores.append(
-            (
-                bool(resultado.atipico_diario),
-                idoneo_dia,
-                bool(resultado.atipico_horario),
-                idoneo_hora,
-                int(registro.id),
-            )
+        id_registro = int(registro.id)
+
+        nuevo = (
+            bool(resultado.atipico_diario),
+            idoneo_dia,
+            bool(resultado.atipico_horario),
+            idoneo_hora,
+            id_registro,
         )
+
+        anterior = por_id.get(id_registro)
+
+        if anterior is None:
+            por_id[id_registro] = nuevo
+            continue
+
+        por_id[id_registro] = (
+            bool(anterior[0] or nuevo[0]),
+            nuevo[1] if nuevo[1] is not None else anterior[1],
+            bool(anterior[2] or nuevo[2]),
+            nuevo[3] if nuevo[3] is not None else anterior[3],
+            id_registro,
+        )
+
+    valores = list(por_id.values())
 
     if not valores:
         print("[POSTGRES] Sin métricas de atípicos para actualizar.")
         return
 
+    total = len(valores)
+
+    print(
+        f"[POSTGRES] Métricas únicas a actualizar: {total}"
+    )
+
     query = """
-        UPDATE public.consumo_agua
+        UPDATE public.consumo_agua AS c
         SET
-            atipico_dia = %s,
-            idoneo_dia = %s,
-            atipico_hora = %s,
-            idoneo_hora = %s
-        WHERE id = %s
+            atipico_dia = v.atipico_dia,
+            idoneo_dia = v.idoneo_dia,
+            atipico_hora = v.atipico_hora,
+            idoneo_hora = v.idoneo_hora
+        FROM (VALUES %s) AS v(
+            atipico_dia,
+            idoneo_dia,
+            atipico_hora,
+            idoneo_hora,
+            id
+        )
+        WHERE c.id = v.id
     """
+
+    actualizados = 0
 
     with get_conn() as conn:
         with conn.cursor() as cursor:
-            cursor.executemany(
-                query,
-                valores,
-            )
 
-        conn.commit()
+            for inicio_lote in range(
+                0,
+                total,
+                batch_size,
+            ):
+                lote = valores[
+                    inicio_lote:
+                    inicio_lote + batch_size
+                ]
+
+                execute_values(
+                    cursor,
+                    query,
+                    lote,
+                    template="(%s, %s, %s, %s, %s)",
+                    page_size=batch_size,
+                )
+
+                conn.commit()
+
+                actualizados += len(lote)
+
+                print(
+                    f"[POSTGRES] Métricas: "
+                    f"{actualizados}/{total}"
+                )
+
+    segundos = time.perf_counter() - inicio
 
     print(
         f"[POSTGRES] Métricas de atípicos actualizadas: "
-        f"{len(valores)} registros"
+        f"{actualizados} registros ({segundos:.2f}s)"
     )
