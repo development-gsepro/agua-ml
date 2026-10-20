@@ -36,7 +36,7 @@ ObservacionHoraria = tuple[float, str]
 
 # MULTIPLICADOR DE AUMENTO
 # 1.0 = valores originales; > 1.0 = mayor tolerancia.
-MULTIPLICADOR_AUMENTO = 1.0
+MULTIPLICADOR_AUMENTO = 1.8
 
 # Percentiles para calcular los cuartiles.
 PERCENTIL_Q1 = 0.25
