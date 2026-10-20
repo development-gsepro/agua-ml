@@ -1101,5 +1101,5 @@ def aplicar_modelo_atipicos_positivos(
         f"{len(ids_vacios_finales)}"
     )
 
-    generar_evidencia_atipicos_positivos(resultados, modelo)
+#    generar_evidencia_atipicos_positivos(resultados, modelo)
     return tags_positivos, ids_vacios_finales, resultados
