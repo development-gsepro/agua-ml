@@ -130,9 +130,9 @@ def test_aplicacion_respeta_candidatos(tmp_path, monkeypatch):
         [positivo, normal, protegido], registros, modelo
     )
 
-    assert ids_pos == {1: "ATÍPICO POSITIVO HORA"}
-    assert ids_vacios == [2]
-    assert positivo.tag == "ATÍPICO POSITIVO HORA"
+    assert ids_pos == {}
+    assert ids_vacios == [1, 2]
+    assert positivo.tag == ""
     assert normal.tag == ""
     assert protegido.tag == "FUGA ACTIVA"
     assert len(resultados) == 3
@@ -390,9 +390,9 @@ def test_dia_atipico_bajo():
         _consumo(20, 10, fecha, hora=8)
     )
 
-    assert r.atipico_diario is True
-    assert r.direccion_diaria == "BAJO"
-    assert r.limite_inferior_diario == 100.0
+    assert r.atipico_diario is False
+    assert r.direccion_diaria is None
+    assert r.limite_inferior_diario is None
     assert r.limite_diario == 100.0
 
 
@@ -413,7 +413,7 @@ def test_dia_atipico_alto_indica_direccion():
 
     assert r.atipico_diario is True
     assert r.direccion_diaria == "ALTO"
-    assert r.limite_inferior_diario == 100.0
+    assert r.limite_inferior_diario is None
     assert r.limite_diario == 100.0
 
 
@@ -479,12 +479,10 @@ def test_aplicacion_asigna_tag_atipico_bajo_dia(
         )
     )
 
-    assert tags == {
-        1: "ATÍPICO BAJO DÍA"
-    }
-    assert ids_vacios == []
-    assert consumo.tag == "ATÍPICO BAJO DÍA"
-    assert resultados[0].direccion_diaria == "BAJO"
+    assert tags == {}
+    assert ids_vacios == [1]
+    assert consumo.tag == ""
+    assert resultados[0].direccion_diaria is None
 
 
 def test_bodega_san_miguel_29_normal_30_alto():
@@ -583,3 +581,74 @@ def test_bodega_san_miguel_29_normal_30_alto():
 
     assert r30.atipico_diario is True
     assert r30.direccion_diaria == "ALTO"
+
+
+def test_multiplicador_reduce_atipicos_diarios(monkeypatch):
+    fecha = datetime(2026, 9, 8)
+
+    valores = [100, 102, 98, 101, 99, 100, 103, 160, 220, 400]
+
+    filas = []
+
+    for i, total in enumerate(valores, start=1):
+        filas.append({
+            "idVBox": 999,
+            "Sucursal": "Sucursal prueba",
+            "Cliente": "CLIENTE PRUEBA",
+            "Ciudad": "CIUDAD PRUEBA",
+            "Area": "Suministro",
+            "Fecha": datetime(2026, 9, i),
+            "consumoTotal": float(total),
+            "hora": 8,
+            "ConsumoHora": 10.0,
+            "tag": "",
+            "categoria": "",
+        })
+
+    df = pd.DataFrame(filas)
+
+    conteos = []
+
+    for multiplicador in (1.0, 1.5, 1.8):
+        monkeypatch.setattr(
+            servicio_atipicos,
+            "MULTIPLICADOR_AUMENTO",
+            multiplicador,
+        )
+
+        modelo = ModeloAtipicosPositivos(7).entrenar(df)
+
+        total_atipicos = 0
+
+        for fila in filas:
+            consumo = ConsumoAgua(
+                idVBox=fila["idVBox"],
+                Sucursal=fila["Sucursal"],
+                Cliente=fila["Cliente"],
+                Area=fila["Area"],
+                NombreMedidor="Medidor",
+                Ciudad=fila["Ciudad"],
+                Formato="",
+                Mercado="",
+                Campo="",
+                tipo="Invasivo",
+                M2=100.0,
+                Fecha=fila["Fecha"],
+                consumoTotal=fila["consumoTotal"],
+                hora=fila["hora"],
+                ConsumoHora=fila["ConsumoHora"],
+                tag="SIN CATEGORIZAR",
+                categoria="",
+            )
+
+            resultado = modelo.evaluar(consumo)
+
+            if (
+                resultado.atipico_diario
+                and resultado.direccion_diaria == "ALTO"
+            ):
+                total_atipicos += 1
+
+        conteos.append(total_atipicos)
+
+    assert conteos[0] >= conteos[1] >= conteos[2]

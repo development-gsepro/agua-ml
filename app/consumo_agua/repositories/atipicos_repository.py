@@ -21,8 +21,6 @@ def actualizar_tags_atipicos_positivos(
         with conn.cursor() as cursor:
             for tag in (
                 "ATÍPICO POSITIVO DÍA",
-                "ATÍPICO POSITIVO HORA",
-                "ATÍPICO BAJO DÍA",
             ):
                 ids_tag = [
                     id_registro

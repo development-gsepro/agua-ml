@@ -36,7 +36,6 @@ from .services.atipicos_positivos import (
     aplicar_modelo_atipicos_positivos,
     entrenar_y_guardar_modelo,
     TAG_ATIPICO_POSITIVO_DIA,
-    TAG_ATIPICO_POSITIVO_HORA,
 )
 from .utils.normalizacion import clave_consumo, clave_medidor
 
@@ -73,8 +72,6 @@ def validar_reglas_finales(consumos: list[ConsumoAgua]) -> dict[str, int]:
         "MEDIDOR SIN AGUA": 0,
         "FUGA REPARADA": 0,
         "ATÍPICO POSITIVO DÍA": 0,
-        "ATÍPICO POSITIVO HORA": 0,
-        "ATÍPICO BAJO DÍA": 0,
         "VACÍO": 0,
         "CONSUMO HORA -1": 0,
     }
@@ -100,10 +97,6 @@ def validar_reglas_finales(consumos: list[ConsumoAgua]) -> dict[str, int]:
             errores["FUGA REPARADA"] += 1
         elif tag == TAG_ATIPICO_POSITIVO_DIA and total <= 0:
             errores["ATÍPICO POSITIVO DÍA"] += 1
-        elif tag == TAG_ATIPICO_POSITIVO_HORA and total <= 0:
-            errores["ATÍPICO POSITIVO HORA"] += 1
-        elif tag == "ATÍPICO BAJO DÍA" and total <= 0:
-            errores["ATÍPICO BAJO DÍA"] += 1
         elif tag == "" and total <= 0:
             errores["VACÍO"] += 1
 
@@ -267,9 +260,7 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     )
     print(
         f"[ATÍPICO POSITIVO] DÍA: "
-        f"{sum(tag == TAG_ATIPICO_POSITIVO_DIA for tag in tags_positivos.values())} | "
-        f"HORA: "
-        f"{sum(tag == TAG_ATIPICO_POSITIVO_HORA for tag in tags_positivos.values())}"
+        f"{sum(tag == TAG_ATIPICO_POSITIVO_DIA for tag in tags_positivos.values())}"
     )
 
     verificar_sincronizacion(consumos, registros_db)

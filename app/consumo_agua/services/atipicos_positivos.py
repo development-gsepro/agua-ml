@@ -531,8 +531,8 @@ class ModeloAtipicosPositivos:
         q3 = float(np.quantile(referencia, 0.75))
         iqr = q3 - q1
 
-        limite_inferior = q1 - iqr
-        limite_superior = q3 + iqr
+        limite_inferior = None
+        limite_superior = q3 + (MULTIPLICADOR_AUMENTO * iqr)
 
         posicion = int(
             np.searchsorted(referencia, valor, side="right")
@@ -540,9 +540,7 @@ class ModeloAtipicosPositivos:
         total = len(referencia) + 1
         percentil = 100.0 * posicion / total
 
-        if valor < limite_inferior:
-            direccion = "BAJO"
-        elif valor > limite_superior:
+        if valor > limite_superior:
             exceso_limite = (
                 (valor / limite_superior) - 1.0
                 if limite_superior > 0
@@ -567,7 +565,7 @@ class ModeloAtipicosPositivos:
 
         return (
             direccion is not None,
-            float(limite_inferior),
+            None,
             float(limite_superior),
             len(referencia),
             posicion,
@@ -1045,30 +1043,9 @@ def aplicar_modelo_atipicos_positivos(
         if not candidato_tag:
             continue
 
-        if resultado.es_atipico:
-            if resultado.atipico_diario:
-                if resultado.direccion_diaria == "BAJO":
-                    tag_positivo = TAG_ATIPICO_BAJO_DIA
-                else:
-                    tag_positivo = TAG_ATIPICO_POSITIVO_DIA
-            else:
-                tag_positivo = TAG_ATIPICO_POSITIVO_HORA
-
-            tags_dia = {
-                TAG_ATIPICO_POSITIVO_DIA,
-                TAG_ATIPICO_BAJO_DIA,
-            }
-
-            tag_anterior = tags_positivos.get(registro.id)
-
-            if tag_anterior in tags_dia:
-                tags_positivos[registro.id] = tag_anterior
-            elif tag_positivo in tags_dia:
-                tags_positivos[registro.id] = tag_positivo
-            else:
-                tags_positivos[registro.id] = TAG_ATIPICO_POSITIVO_HORA
-
-            consumo.tag = tags_positivos[registro.id]
+        if resultado.atipico_diario:
+            tags_positivos[registro.id] = TAG_ATIPICO_POSITIVO_DIA
+            consumo.tag = TAG_ATIPICO_POSITIVO_DIA
         else:
             consumo.tag = ""
             ids_vacios.append(registro.id)
@@ -1087,10 +1064,6 @@ def aplicar_modelo_atipicos_positivos(
     print(
         "[ATÍPICO POSITIVO] DÍA: "
         f"{sum(tag == TAG_ATIPICO_POSITIVO_DIA for tag in tags_positivos.values())}"
-    )
-    print(
-        "[ATÍPICO POSITIVO] HORA: "
-        f"{sum(tag == TAG_ATIPICO_POSITIVO_HORA for tag in tags_positivos.values())}"
     )
     print(
         "[ATÍPICO POSITIVO] IDs presentes en positivos Y vacíos antes de depurar: "
