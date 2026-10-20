@@ -34,6 +34,25 @@ ObservacionDiaria = tuple[float, str]
 ObservacionHoraria = tuple[float, str]
 
 
+# MULTIPLICADOR DE AUMENTO
+# 1.0 = valores originales; > 1.0 = mayor tolerancia.
+MULTIPLICADOR_AUMENTO = 1.0
+
+# Percentiles para calcular los cuartiles.
+PERCENTIL_Q1 = 0.25
+PERCENTIL_Q3 = 0.75
+
+# Factor de escala para estimar la desviación estándar robusta.
+FACTOR_ESCALA_MAD = 1.4826
+
+# Factores base para los límites de detección.
+FACTOR_LIMITE_MAD_BASE = 3.5
+FACTOR_LIMITE_IQR_BASE = 1.5
+
+# Factores ajustados según la prueba.
+FACTOR_LIMITE_MAD = FACTOR_LIMITE_MAD_BASE * MULTIPLICADOR_AUMENTO
+FACTOR_LIMITE_IQR = FACTOR_LIMITE_IQR_BASE * MULTIPLICADOR_AUMENTO
+
 def normalizar_grupo(valor: object) -> str:
     texto = str(valor or "").strip().upper()
     return re.sub(r"\s+", " ", texto)
@@ -143,13 +162,13 @@ class ModeloAtipicosPositivos:
     def _estadisticas(valores: np.ndarray) -> tuple[float, float, float, float, float]:
         valores = valores[np.isfinite(valores)]
         mediana = float(np.median(valores))
-        q1 = float(np.quantile(valores, 0.25))
-        q3 = float(np.quantile(valores, 0.75))
+        q1 = float(np.quantile(valores, PERCENTIL_Q1))
+        q3 = float(np.quantile(valores, PERCENTIL_Q3))
         iqr = q3 - q1
         mad = float(np.median(np.abs(valores - mediana)))
-        sigma_robusta = 1.4826 * mad
-        limite_mad = mediana + 3.5 * sigma_robusta
-        limite_iqr = q3 + 1.5 * iqr
+        sigma_robusta = FACTOR_ESCALA_MAD * mad
+        limite_mad = mediana + FACTOR_LIMITE_MAD * sigma_robusta
+        limite_iqr = q3 + FACTOR_LIMITE_IQR * iqr
         limite = max(limite_mad, limite_iqr, mediana)
         return mediana, mad, q1, q3, float(limite)
 
