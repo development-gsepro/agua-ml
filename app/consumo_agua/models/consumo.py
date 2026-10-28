@@ -20,6 +20,7 @@ def es_hora_madrugada(hora: object) -> bool:
 
 @dataclass(slots=True)
 class ConsumoAgua:
+    cc: int
     idVBox: int
     Sucursal: str
     Cliente: str

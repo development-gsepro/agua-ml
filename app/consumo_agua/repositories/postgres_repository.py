@@ -35,15 +35,28 @@ def valor_numeric_postgres(valor, campo: str, limite_max: float = NUMERIC_20_2_M
 
 def row_a_consumo_db(row) -> ConsumoDB:
     consumo = ConsumoAgua(
-        idVBox=row[1], Sucursal=row[2], NombreMedidor=row[3],
-        Formato=row[4], Mercado=row[5], Campo=row[6], tipo=row[7],
-        M2=row[8], Fecha=row[9], consumoTotal=row[10], hora=row[11],
-        ConsumoHora=row[12], tag=row[13] or "", categoria=row[14] or "",
-        setpoint_agua=row[15] or 0.0, Cliente=row[16] or "",
-        Area=row[17] or "", Ciudad=row[18] or "",
+        cc=int(row[1] or 0),
+        idVBox=row[2],
+        Sucursal=row[3] or "",
+        NombreMedidor=row[4] or "",
+        Formato=row[5] or "",
+        Mercado=row[6] or "",
+        Campo=row[7] or "",
+        tipo=row[8] or "",
+        M2=row[9],
+        Fecha=row[10],
+        consumoTotal=row[11],
+        hora=int(row[12] or 0),
+        ConsumoHora=row[13],
+        tag=row[14] or "",
+        categoria=row[15] or "",
+        setpoint_agua=row[16] or 0.0,
+        Cliente=row[17] or "",
+        Area=row[18] or "",
+        Ciudad=row[19] or "",
     )
-    return ConsumoDB(id=row[0], consumo=consumo)
 
+    return ConsumoDB(id=row[0], consumo=consumo)
 
 
 def seleccionar_registro_representativo(
@@ -70,7 +83,7 @@ def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
     print(f"[POSTGRES] Insertando {len(consumos)} registros...")
     query = '''
         INSERT INTO public.consumo_agua (
-            "idVBox", "Sucursal", "NombreMedidor", "Formato", "Mercado",
+            cc, "idVBox", "Sucursal", "NombreMedidor", "Formato", "Mercado",
             "Campo", tipo, "M2", "Fecha", "consumoTotal", hora,
             "ConsumoHora", tag, categoria, setpoint_agua, "Cliente",
             "Area", "Ciudad"
@@ -84,7 +97,7 @@ def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
             for posicion in range(0, len(consumos), BATCH_SIZE):
                 lote = consumos[posicion: posicion + BATCH_SIZE]
                 valores = [(
-                    c.idVBox, c.Sucursal, c.NombreMedidor, c.Formato,
+                    c.cc, c.idVBox, c.Sucursal, c.NombreMedidor, c.Formato,
                     c.Mercado, c.Campo, c.tipo,
                     valor_numeric_postgres(c.M2, "M2", NUMERIC_10_2_MAX),
                     c.Fecha,
@@ -151,6 +164,7 @@ def obtener_historico_postgres(
             c.hora
         )
             c.id,
+            c.cc,
             c."idVBox",
             c."Sucursal",
             c."NombreMedidor",

@@ -119,23 +119,67 @@ def cargar_setpoints() -> dict:
     return {}
 
 
+
 def consumoTotalHora(fecha) -> list[ConsumoAgua]:
-    query = "EXEC dbo.SP_ReporteConsumoAguaDiario_PowerBI @fecIni=?, @fecFin=?"
+    query = """
+        EXEC dbo.SP_ReporteConsumoAguaDiario_PowerBI
+            @fecIni=?, @fecFin=?
+    """
+
     for intento in range(1, MAX_RETRIES + 1):
         try:
             with get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(query, (fecha, fecha))
+
                     while cursor.description is None:
                         if not cursor.nextset():
                             return []
+
+                    columnas = [
+                        columna[0] for columna in cursor.description
+                    ]
                     rows = cursor.fetchall()
-            return [ConsumoAgua(*row) for row in rows]
+
+            resultados = []
+
+            for row in rows:
+                fila = dict(zip(columnas, row))
+
+                resultados.append(
+                    ConsumoAgua(
+                        cc=int(fila.get("CC") or 0),
+                        idVBox=int(fila.get("idVBox") or 0),
+                        Sucursal=str(fila.get("Sucursal") or ""),
+                        Cliente=str(fila.get("cliente") or ""),
+                        Area=str(fila.get("Area") or ""),
+                        NombreMedidor=str(fila.get("NombreMedidor") or ""),
+                        Ciudad=str(fila.get("ciudad") or ""),
+                        Formato=str(fila.get("Formato") or ""),
+                        Mercado=str(fila.get("Mercado") or ""),
+                        Campo=str(fila.get("Campo") or ""),
+                        tipo=str(fila.get("tipo") or ""),
+                        M2=fila.get("M2"),
+                        Fecha=fila.get("Fecha"),
+                        consumoTotal=fila.get("consumoTotal"),
+                        hora=int(fila.get("hora") or 0),
+                        ConsumoHora=fila.get("ConsumoHora"),
+                    )
+                )
+
+            return resultados
+
         except Exception as e:
-            print(f"[MSSQL {fecha}] ERROR {intento}/{MAX_RETRIES}: {e}")
+            print(
+                f"[MSSQL {fecha}] ERROR "
+                f"{intento}/{MAX_RETRIES}: {e}"
+            )
+
             if intento < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
+
     return []
+
 
 
 def buscar_setpoint(setpoints: dict, consumo: ConsumoAgua) -> Optional[SetPointAgua]:

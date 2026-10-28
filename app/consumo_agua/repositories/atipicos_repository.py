@@ -130,20 +130,28 @@ def actualizar_metricas_atipicos(
         f"[POSTGRES] Métricas únicas a actualizar: {total}"
     )
 
-    query = """
+    query = """        
         UPDATE public.consumo_agua AS c
         SET
             atipico_dia = v.atipico_dia,
             idoneo_dia = v.idoneo_dia,
             atipico_hora = v.atipico_hora,
             idoneo_hora = v.idoneo_hora
-        FROM (VALUES %s) AS v(
-            atipico_dia,
-            idoneo_dia,
-            atipico_hora,
-            idoneo_hora,
-            id
-        )
+        FROM (
+            SELECT
+                x.atipico_dia::boolean AS atipico_dia,
+                x.idoneo_dia::numeric AS idoneo_dia,
+                x.atipico_hora::boolean AS atipico_hora,
+                x.idoneo_hora::numeric AS idoneo_hora,
+                x.id::bigint AS id
+            FROM (VALUES %s) AS x(
+                atipico_dia,
+                idoneo_dia,
+                atipico_hora,
+                idoneo_hora,
+                id
+            )
+        ) AS v
         WHERE c.id = v.id
     """
 
