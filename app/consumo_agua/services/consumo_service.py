@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta
+from collections import Counter
 from typing import Optional
 import time
 
 from ...shared.database.databaseMSSQL import get_connection
+from ...shared.database.databasePostgress import get_connection as get_pg_connection
 from ..models.consumo import ConsumoAgua, SetPointAgua
 from ..utils.normalizacion import (
     clave_consumo, clave_medidor, fecha_solo, fila_a_setpoint, indice_columnas,
@@ -234,21 +236,49 @@ def aplicar_setpoints(consumos: list[ConsumoAgua], setpoints: dict) -> None:
 
 
 def verificar_sincronizacion(consumos_recibidos: list[ConsumoAgua], registros_db: dict) -> bool:
-    claves_mssql = {clave_consumo(c) for c in consumos_recibidos}
-    claves_postgres = set(registros_db.keys())
-    print("\n" + "=" * 70)
-    print("VERIFICACIÓN FINAL")
+    """Compara directamente las multiplicidades de MSSQL y PostgreSQL.
+
+    Los adicionales de años/días con datos históricos se informan, pero la
+    falta de filas pedidas por MSSQL hace fallar la verificación.
+    """
+    from ..repositories.postgres_repository import _conteos_existentes_dia
+
+    origen = Counter(clave_consumo(c) for c in consumos_recibidos)
+    dias = sorted({fecha_solo(c.Fecha) for c in consumos_recibidos})
+    faltantes = Counter()
+    adicionales = Counter()
+    total_db = 0
+    with get_pg_connection() as conn:
+        with conn.cursor() as cursor:
+            for dia in dias:
+                actual = _conteos_existentes_dia(cursor, dia)
+                for clave, (cantidad, _) in actual.items():
+                    total_db += cantidad
+                    adicional = cantidad - origen.get(clave, 0)
+                    if adicional > 0:
+                        adicionales[clave] = adicional
+                for clave, cantidad in origen.items():
+                    if clave[2] != dia:
+                        continue
+                    deficit = cantidad - actual.get(clave, (0, None))[0]
+                    if deficit > 0:
+                        faltantes[clave] = deficit
+
+    print("\\n" + "=" * 70)
+    print("VERIFICACIÓN FINAL — CONSULTA DIRECTA A POSTGRESQL")
     print("=" * 70)
-    print(f"MSSQL recibidos (incluye duplicados): {len(consumos_recibidos)}")
-    print(f"Claves únicas en MSSQL: {len(claves_mssql)}")
-    print(f"PostgreSQL encontrados: {len(claves_postgres)}")
-    print(f"Faltantes: {len(claves_mssql - claves_postgres)}")
-    print(f"Adicionales: {len(claves_postgres - claves_mssql)}")
-    if claves_mssql - claves_postgres:
-        print("\n[ERROR] REGISTROS FALTANTES:")
-        for clave in list(claves_mssql - claves_postgres)[:20]:
-            print(f"  {clave}")
+    print(f"MSSQL filas recibidas: {sum(origen.values())}")
+    print(f"MSSQL claves únicas: {len(origen)}")
+    print(f"PostgreSQL filas en fechas solicitadas: {total_db}")
+    print(f"Claves con déficit: {len(faltantes)}")
+    print(f"Filas faltantes: {sum(faltantes.values())}")
+    print(f"Filas adicionales (incluye duplicados históricos): {sum(adicionales.values())}")
+    for clave, cantidad in faltantes.most_common(20):
+        print(f"  [FALTA] {clave}: {cantidad}")
+    if faltantes:
+        print("[ERROR] La sincronización NO está completa.")
         return False
-    print("\n[OK] TODAS LAS CLAVES ÚNICAS DE MSSQL ESTÁN EN POSTGRESQL.")
-    print("=" * 70)
+    print("[OK] Las claves y multiplicidades de entrada están cubiertas en PG.")
+    if adicionales:
+        print("[ADVERTENCIA] Hay filas históricas adicionales; NO se borraron.")
     return True
