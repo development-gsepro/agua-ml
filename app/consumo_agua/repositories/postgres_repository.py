@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from collections import Counter, defaultdict
 import math
 import time
 
@@ -6,7 +7,7 @@ from psycopg2.extras import execute_values
 
 from ...shared.database.databasePostgress import get_connection as get_conn
 from ..models.consumo import ConsumoAgua, ConsumoDB
-from ..utils.normalizacion import clave_consumo
+from ..utils.normalizacion import clave_consumo, fecha_solo
 
 BATCH_SIZE = 10000
 NUMERIC_10_2_MAX = 99_999_999.99
@@ -77,10 +78,42 @@ def seleccionar_registro_representativo(
 
     return nuevo
 
+# Debe coincidir con normalizar_medidor(): espacios, mayúsculas y bordes.
+_AREA_SQL = r"""regexp_replace(
+    regexp_replace(UPPER(TRIM(COALESCE("Area", ''))), '\\s+', ' ', 'g'),
+    '^[ .]+|[ .]+$', '', 'g'
+)"""
+
+
+def _conteos_existentes_dia(cursor, dia: date) -> dict:
+    """Cuenta las multiplicidades existentes por clave; no confunde duplicados legítimos.
+
+    Consulta agrupada por día: evita descargar millones de filas individuales
+    de una base que ya contiene inserciones repetidas.
+    """
+    cursor.execute(f"""
+        SELECT "idVBox", {_AREA_SQL}, "Fecha"::date, hora,
+               COUNT(*)::bigint, MAX(id)
+        FROM public.consumo_agua
+        WHERE "Fecha" >= %s AND "Fecha" < %s
+        GROUP BY 1, 2, 3, 4
+    """, (dia, dia + timedelta(days=1)))
+    return {
+        (int(vbox), area, fecha, int(hora)): (int(cantidad), int(id_max))
+        for vbox, area, fecha, hora, cantidad, id_max in cursor
+    }
+
+
 def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
+    """Inserta solo el déficit de filas por clave y conserva IDs reutilizados.
+
+    Si MSSQL entrega N filas bajo una misma clave y PostgreSQL ya tiene M,
+    inserta max(0, N-M). Una segunda ejecución no añade nuevas copias.
+    No depura datos antiguos ni sobrescribe mediciones históricas.
+    """
     if not consumos:
         return {}
-    print(f"[POSTGRES] Insertando {len(consumos)} registros...")
+    print(f"[POSTGRES] Verificando {len(consumos)} registros antes de insertar...")
     query = '''
         INSERT INTO public.consumo_agua (
             cc, "idVBox", "Sucursal", "NombreMedidor", "Formato", "Mercado",
@@ -89,48 +122,71 @@ def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
             "Area", "Ciudad"
         ) VALUES %s RETURNING id
     '''
+    por_dia = defaultdict(list)
+    for c in consumos:
+        por_dia[fecha_solo(c.Fecha)].append(c)
+
     resultado = {}
     insertados = 0
+    reutilizados = 0
     inicio = time.perf_counter()
     with get_conn() as conn:
         with conn.cursor() as cursor:
-            for posicion in range(0, len(consumos), BATCH_SIZE):
-                lote = consumos[posicion: posicion + BATCH_SIZE]
-                valores = [(
-                    c.cc, c.idVBox, c.Sucursal, c.NombreMedidor, c.Formato,
-                    c.Mercado, c.Campo, c.tipo,
-                    valor_numeric_postgres(c.M2, "M2", NUMERIC_10_2_MAX),
-                    c.Fecha,
-                    valor_numeric_postgres(c.consumoTotal, "consumoTotal", NUMERIC_20_2_MAX),
-                    c.hora,
-                    valor_numeric_postgres(c.ConsumoHora, "ConsumoHora", NUMERIC_20_2_MAX),
-                    c.tag or "", c.categoria or "",
-                    valor_numeric_postgres(c.setpoint_agua, "setpoint_agua", NUMERIC_20_2_MAX),
-                    c.Cliente, c.Area, c.Ciudad,
-                ) for c in lote]
-                rows = execute_values(
-                    cursor, query, valores, page_size=BATCH_SIZE, fetch=True
-                )
-                if len(rows) != len(lote):
-                    raise RuntimeError(
-                        "INSERT inconsistente: "
-                        f"{len(lote)} enviados / {len(rows)} IDs"
-                    )
-                for consumo, row in zip(lote, rows):
-                    clave = clave_consumo(consumo)
-                    registro = ConsumoDB(
-                        id=row[0],
-                        consumo=consumo,
-                    )
-                    resultado[clave] = seleccionar_registro_representativo(
-                        resultado.get(clave),
-                        registro,
-                    )
-                insertados += len(lote)
-                print(f"[POSTGRES] {insertados}/{len(consumos)} insertados")
-            conn.commit()
-    segundos = time.perf_counter() - inicio
-    print(f"[POSTGRES] Insertados: {insertados} ({segundos:.2f}s)")
+            # Serializa ejecuciones de esta versión del programa; no bloquea
+            # otros clientes que escriban directamente en la tabla.
+            cursor.execute("SELECT pg_advisory_xact_lock(193681, 20261030)")
+            for dia, consumos_dia in sorted(por_dia.items()):
+                existentes = _conteos_existentes_dia(cursor, dia)
+                origen = Counter(clave_consumo(c) for c in consumos_dia)
+                candidatos = defaultdict(list)
+                for c in consumos_dia:
+                    candidatos[clave_consumo(c)].append(c)
+
+                pendientes = []
+                for clave, items in candidatos.items():
+                    cantidad_anterior, id_reutilizado = existentes.get(clave, (0, None))
+                    cantidad_nueva = max(0, len(items) - cantidad_anterior)
+                    reutilizados += min(len(items), cantidad_anterior)
+                    if id_reutilizado is not None:
+                        resultado[clave] = ConsumoDB(
+                            id=id_reutilizado, consumo=items[-1]
+                        )
+                    if cantidad_nueva:
+                        pendientes.extend(items[-cantidad_nueva:])
+
+                for posicion in range(0, len(pendientes), BATCH_SIZE):
+                    lote = pendientes[posicion: posicion + BATCH_SIZE]
+                    valores = [(
+                        c.cc, c.idVBox, c.Sucursal, c.NombreMedidor, c.Formato,
+                        c.Mercado, c.Campo, c.tipo,
+                        valor_numeric_postgres(c.M2, "M2", NUMERIC_10_2_MAX),
+                        c.Fecha,
+                        valor_numeric_postgres(c.consumoTotal, "consumoTotal", NUMERIC_20_2_MAX),
+                        c.hora,
+                        valor_numeric_postgres(c.ConsumoHora, "ConsumoHora", NUMERIC_20_2_MAX),
+                        c.tag or "", c.categoria or "",
+                        valor_numeric_postgres(c.setpoint_agua, "setpoint_agua", NUMERIC_20_2_MAX),
+                        c.Cliente, c.Area, c.Ciudad,
+                    ) for c in lote]
+                    rows = execute_values(cursor, query, valores,
+                                          page_size=BATCH_SIZE, fetch=True)
+                    if len(rows) != len(lote):
+                        raise RuntimeError(
+                            f"INSERT inconsistente: {len(lote)} enviados / {len(rows)} IDs"
+                        )
+                    for consumo, row in zip(lote, rows):
+                        clave = clave_consumo(consumo)
+                        nuevo = ConsumoDB(id=row[0], consumo=consumo)
+                        resultado[clave] = seleccionar_registro_representativo(
+                            resultado.get(clave), nuevo
+                        )
+                    insertados += len(lote)
+                print(f"[POSTGRES {dia}] origen={len(consumos_dia)} "
+                      f"nuevos={len(pendientes)} claves={len(origen)}")
+        conn.commit()
+    print(f"[POSTGRES] Nuevas filas: {insertados}; "
+          f"filas cubiertas por existentes: {reutilizados} "
+          f"({time.perf_counter() - inicio:.2f}s)")
     return resultado
 
 
