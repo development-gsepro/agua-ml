@@ -291,7 +291,7 @@ def verificar_sincronizacion(consumos_recibidos: list[ConsumoAgua], registros_db
                         firma_pg = (esperada[0], *firma_pg[1:])
                     if (
                         esperada[1] == 7369
-                        and fecha_solo(esperada[9]).isoformat() >= '2026-09-01'
+                        and '2026-09-01' <= fecha_solo(esperada[9]).isoformat() <= '2026-09-03'
                         and esperada[14] == 'Demasías'
                         and firma_pg[14] == 'Agua principal'
                     ):

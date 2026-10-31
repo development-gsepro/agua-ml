@@ -220,7 +220,7 @@ def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
                             # No modificar el registro histórico ni insertar copia.
                             if (
                                 int(c.idVBox) == 7369
-                                and fecha_solo(c.Fecha) >= date(2026, 9, 1)
+                                and date(2026, 9, 1) <= fecha_solo(c.Fecha) <= date(2026, 9, 3)
                                 and str(c.Area or '').strip() == 'Demasías'
                             ):
                                 candidatos = [

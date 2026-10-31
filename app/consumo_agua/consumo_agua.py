@@ -70,7 +70,7 @@ def _filas_existentes_simulacion(consumos: list[ConsumoAgua]) -> dict:
                     if (
                         not candidatos and int(consumo.idVBox) == 7369
                         and clave[14] == 'Demasías'
-                        and dia >= datetime(2026, 9, 1).date()
+                        and datetime(2026, 9, 1).date() <= dia <= datetime(2026, 9, 3).date()
                     ):
                         for cc in (clave[0], None, 0):
                             anterior = (cc, *clave[1:14], 'Agua principal', clave[15])
@@ -185,7 +185,7 @@ def separar_medidores_protegidos(consumos: list[ConsumoAgua]):
     if any(
         int(c.idVBox) == 7369
         and str(c.Area or '').strip() == 'Demasías'
-        and c.Fecha.isoformat()[:10] >= '2026-09-01'
+        and '2026-09-01' <= c.Fecha.isoformat()[:10] <= '2026-09-03'
         for c in consumos
     ):
         protegidos.add(clave_medidor(7369, 'Demasías'))

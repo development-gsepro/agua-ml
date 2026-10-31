@@ -160,10 +160,15 @@ class ModeloAtipicosPositivos:
 
     @staticmethod
     def _estadisticas(valores: np.ndarray) -> tuple[float, float, float, float, float]:
+        valores = np.asarray(valores, dtype=np.float64).ravel()
         valores = valores[np.isfinite(valores)]
+        if valores.size == 0:
+            raise ValueError("No hay valores válidos para calcular estadísticas")
         mediana = float(np.median(valores))
-        q1 = float(np.quantile(valores, PERCENTIL_Q1))
-        q3 = float(np.quantile(valores, PERCENTIL_Q3))
+        q1, q3 = map(
+            float,
+            np.quantile(valores, [PERCENTIL_Q1, PERCENTIL_Q3])
+        )
         iqr = q3 - q1
         mad = float(np.median(np.abs(valores - mediana)))
         sigma_robusta = FACTOR_ESCALA_MAD * mad
