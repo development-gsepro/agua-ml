@@ -24,7 +24,7 @@ def evaluar_consumo_elevado(dias: dict[date, DiaConsumo], actualizador: Actualiz
     for fecha_actual in fechas:
         inicio = fecha_actual - timedelta(days=6)
         ventana = [dias[f] for f in fechas if inicio <= f <= fecha_actual]
-        if len(ventana) < 7:
+        if len(ventana) < 7 or any(dia.set_point <= 0 for dia in ventana):
             continue
         if sum(dia.supera_sp for dia in ventana) > 3:
             registros = []
@@ -91,6 +91,11 @@ def evaluar_fuga_reparada(
         fecha_anterior = fechas[i - 4]
         posteriores = fechas[i - 3:i + 1]
 
+        # También el día de antecedente debe ser inmediatamente anterior.
+        # No fabricar una racha si falta un día entre el antecedente y la reparación.
+        if fecha_anterior + timedelta(days=1) != posteriores[0]:
+            continue
+
         # Los cuatro días deben ser consecutivos
         if not all(
             posteriores[j] == fecha_anterior + timedelta(days=j + 1)
@@ -104,12 +109,18 @@ def evaluar_fuga_reparada(
 
         ventana_reparacion = [dias[f] for f in posteriores]
 
+        # Sin SP válido en alguno de los cinco días no puede afirmarse reparación.
+        if dias[fecha_anterior].set_point <= 0 or any(
+            dia.set_point <= 0 for dia in ventana_reparacion
+        ):
+            continue
+
         if any(dia.consumo_total <= 0 for dia in ventana_reparacion):
             continue
 
-        # Los cuatro días deben estar estrictamente debajo del SP.
-        # Si alguno cumple o supera el SP, se rompe la secuencia.
-        if any(dia.supera_sp for dia in ventana_reparacion):
+        # Deben estar ESTRICTAMENTE bajo el SP. Un consumo igual
+        # al SP no demuestra que la fuga esté reparada.
+        if any(dia.consumo_total >= dia.set_point for dia in ventana_reparacion):
             continue
 
         # La etiqueta solamente se aplica al cuarto día
@@ -126,7 +137,7 @@ def evaluar_consumo_madrugada(dias: dict[date, DiaConsumo], actualizador: Actual
     """
     for dia in dias.values():
         total = dia.consumo_total
-        if total <= 0 or dia.supera_sp:
+        if total <= 0 or dia.set_point <= 0 or dia.supera_sp:
             continue
 
         registros_madrugada = [

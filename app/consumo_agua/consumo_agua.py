@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta
+from pathlib import Path
+import os
 from collections import Counter
 import time
 import gc
 
-from .models.consumo import ConsumoAgua, es_medidor_virtual
+from .models.consumo import ConsumoAgua, ConsumoDB, es_medidor_virtual
 from .repositories.postgres_repository import (
     get_conn,
     ActualizadorTags,
@@ -11,6 +13,7 @@ from .repositories.postgres_repository import (
     insertar_consumos,
     obtener_historico_postgres,
     limpiar_tags_ids,
+    _existentes_por_fila_dia,
 )
 from .repositories.atipicos_repository import (
     actualizar_tags_atipicos_positivos,
@@ -35,13 +38,136 @@ from .services.consumo_service import (
 from .services.historico_parquet import obtener_consumos_con_cache, leer_historico
 from .services.atipicos_positivos import (
     MODEL_PATH,
+    ModeloAtipicosPositivos,
     aplicar_modelo_atipicos_positivos,
     entrenar_y_guardar_modelo,
     TAG_ATIPICO_POSITIVO_DIA,
 )
-from .utils.normalizacion import clave_consumo, clave_fila, clave_medidor
+from .utils.normalizacion import clave_consumo, clave_fila, clave_medidor, fecha_solo
 
 DIAS_HISTORICO = 10
+
+
+def _filas_existentes_simulacion(consumos: list[ConsumoAgua]) -> dict:
+    """Resuelve IDs físicos sin ejecutar un solo INSERT/UPDATE."""
+    diferentes = {clave_fila(c): c for c in consumos}
+    por_dia = {}
+    for firma, consumo in diferentes.items():
+        dia = fecha_solo(consumo.Fecha)
+        por_dia.setdefault(dia, []).append((firma, consumo))
+
+    resultado = {}
+    with get_conn() as conexion:
+        with conexion.cursor() as cursor:
+            for dia, filas in sorted(por_dia.items()):
+                existentes = _existentes_por_fila_dia(cursor, dia)
+                for clave, consumo in filas:
+                    candidatos = set()
+                    for cc in (clave[0], None, 0):
+                        anterior = (cc, *clave[1:])
+                        if anterior in existentes:
+                            candidatos.add(int(existentes[anterior]))
+                    if (
+                        not candidatos and int(consumo.idVBox) == 7369
+                        and clave[14] == 'Demasías'
+                        and dia >= datetime(2026, 9, 1).date()
+                    ):
+                        for cc in (clave[0], None, 0):
+                            anterior = (cc, *clave[1:14], 'Agua principal', clave[15])
+                            if anterior in existentes:
+                                candidatos.add(int(existentes[anterior]))
+                    if len(candidatos) != 1:
+                        raise RuntimeError(
+                            f'SIMULACIÓN BLOQUEADA: {dia} idVBox={consumo.idVBox} '
+                            f'hora={consumo.hora}: {len(candidatos)} IDs físicos. '
+                            'Sin insertar ni reclasificar.'
+                        )
+                    resultado[clave] = ConsumoDB(id=candidatos.pop(), consumo=consumo)
+    if len({r.id for r in resultado.values()}) != len(resultado):
+        raise RuntimeError('SIMULACIÓN BLOQUEADA: dos lecturas comparten un ID')
+    return resultado
+
+
+def _preservar_tags_previos(anteriores, futuros):
+    """Conserva tag anterior si la clasificación no propone uno nuevo.
+
+    Una etiqueta nueva no vacía tiene prioridad sobre la antigua.
+    El dato previo se conserva tal cual, sin presumir que está actualizado.
+    Modifica futuros y devuelve los IDs protegidos.
+    """
+    conservados = {}
+    for rid, anterior in anteriores.items():
+        if str(anterior or '').strip() and not str(futuros.get(rid) or '').strip():
+            futuros[rid] = anterior
+            conservados[rid] = anterior
+    return conservados
+
+
+def _previsualizar_etiquetas_sin_escribir(
+    consumos_clasificables, registros_db, actualizador,
+    ids_sin_categoria, tags_positivos, ids_vacios
+):
+    """Reproduce la precedencia de los UPDATE sin ejecutar SQL de escritura."""
+    from collections import Counter as _Counter
+
+    por_id = {
+        registros_db[clave_fila(c)].id: c
+        for c in consumos_clasificables
+        if clave_fila(c) in registros_db
+    }
+    futuros = {}
+    for rid, c in por_id.items():
+        total = float(c.consumoTotal or 0)
+        futuros[rid] = (
+            'MEDIDOR OFFLINE' if total == -1 else
+            'ATÍPICO' if total == 0 else ''
+        )
+    futuros.update({int(k): v for k, v in actualizador.actualizaciones.items()})
+    futuros.update({int(k): 'SIN CATEGORIZAR' for k in ids_sin_categoria})
+    futuros.update({int(k): v for k, v in tags_positivos.items()})
+    futuros.update({int(k): '' for k in ids_vacios if k not in tags_positivos})
+
+    anteriores = {}
+    with get_conn() as conexion:
+        with conexion.cursor() as cursor:
+            ids = list(futuros)
+            for inicio in range(0, len(ids), 5000):
+                cursor.execute(
+                    'SELECT id, tag FROM public.consumo_agua WHERE id=ANY(%s)',
+                    (ids[inicio:inicio + 5000],)
+                )
+                anteriores.update({int(rid): str(tag or '').strip() for rid, tag in cursor})
+    if len(anteriores) != len(futuros):
+        raise RuntimeError('SIMULACIÓN BLOQUEADA: faltan IDs físicos')
+    conservadas = _preservar_tags_previos(anteriores, futuros)
+
+    transiciones = _Counter()
+    perdidas = 0
+    diferencias = 0
+    for rid, futuro in futuros.items():
+        anterior = anteriores[rid]
+        nuevo = str(futuro or '').strip()
+        if anterior != nuevo:
+            diferencias += 1
+            transiciones[(anterior or 'VACÍO', nuevo or 'VACÍO')] += 1
+            if anterior and not nuevo:
+                perdidas += 1
+
+    print('\n' + '=' * 65)
+    print('SIMULACIÓN REAL: PostgreSQL NO MODIFICADO')
+    print('IDs contemplados:', len(futuros))
+    print('Etiquetas que cambiarían:', diferencias)
+    print('Etiquetas antiguas conservadas (sin regla nueva):', len(conservadas))
+    print('Etiquetas no vacías que quedarían vacías:', perdidas)
+    for (antes, despues), n in transiciones.most_common(12):
+        print(f'  {antes} -> {despues}: {n}')
+    print('=' * 65)
+    if perdidas:
+        raise RuntimeError(
+            f'SIMULACIÓN BLOQUEADA: {perdidas} etiquetas se perderían. '
+            'No se escribió en PostgreSQL ni se guardó modelo.'
+        )
+
 
 
 def separar_medidores_protegidos(consumos: list[ConsumoAgua]):
@@ -59,7 +185,7 @@ def separar_medidores_protegidos(consumos: list[ConsumoAgua]):
     if any(
         int(c.idVBox) == 7369
         and str(c.Area or '').strip() == 'Demasías'
-        and c.Fecha.date().isoformat() >= '2026-09-01'
+        and c.Fecha.isoformat()[:10] >= '2026-09-01'
         for c in consumos
     ):
         protegidos.add(clave_medidor(7369, 'Demasías'))
@@ -133,6 +259,7 @@ def validar_reglas_finales(consumos: list[ConsumoAgua]) -> dict[str, int]:
 
 def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     inicio_total = time.perf_counter()
+    solo_simular = os.environ.get('AGUA_MODO_SIMULACION') == '1'
     print("\n" + "#" * 70)
     print("CLASIFICADOR DE CONSUMO DE AGUA")
     print("#" * 70)
@@ -160,11 +287,12 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     df_entrenamiento = leer_historico()
     if df_entrenamiento.empty:
         print("[ENTRENAMIENTO] Sin histórico disponible; se crea modelo vacío.")
-    modelo_atipicos = entrenar_y_guardar_modelo(df_entrenamiento)
+    # Entrenar en memoria; NO sobrescribir el PKL hasta que el COMMIT funcione.
+    modelo_atipicos = ModeloAtipicosPositivos().entrenar(df_entrenamiento)
     del df_entrenamiento
     gc.collect()
     print(
-        f"[ENTRENAMIENTO] PKL actualizado: {MODEL_PATH} | "
+        f"[ENTRENAMIENTO] Modelo calculado en memoria; PKL sin cambios | "
         f"perfiles diarios: {len(modelo_atipicos.perfiles_diarios)} | "
         f"perfiles horarios: {len(modelo_atipicos.perfiles_horarios)}"
     )
@@ -193,7 +321,10 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     print(f"[2/7] Históricos (para clasificación): {len(historicos)}")
 
     print("\n[3/7] INSERTANDO EN POSTGRESQL")
-    registros_db = insertar_consumos(consumos)
+    registros_db = (
+        _filas_existentes_simulacion(consumos)
+        if solo_simular else insertar_consumos(consumos)
+    )
     print(f"[3/7] Filas de origen distintas sincronizadas: {len(registros_db)}")
     # Guardar los IDs permitidos; la actualización se hará al final, de forma atómica.
     ids_clasificables = {
@@ -220,6 +351,9 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
         historico = obtener_historico_postgres(
             claves_medidores, historico_inicio, fecha_fin
         )
+        # IMPORTANTE: los registros antiguos almacenan setpoint_agua=0;
+        # calcular su umbral usando los setpoints MSSQL y la fecha de cada día.
+        aplicar_setpoints([r.consumo for r in historico.values()], setpoints)
         historico_por_medidor = {}
         for registro in historico.values():
             clave = clave_medidor(registro.consumo.idVBox, registro.consumo.Area)
@@ -350,6 +484,14 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
             'No se actualizaron etiquetas.'
         )
 
+    if solo_simular:
+        _previsualizar_etiquetas_sin_escribir(
+            consumos_clasificables, registros_db, actualizador,
+            ids, tags_positivos, ids_vacios,
+        )
+        print('[SIMULACIÓN] Sin INSERT, UPDATE, COMMIT ni guardado de PKL.')
+        return consumos
+
     # El INSERT de lecturas ya pasó su propia transacción. Aquí SOLO se
     # actualizan etiquetas/métricas: o se confirma todo o se revierte todo.
     print('\n[POSTGRES] INICIANDO TRANSACCIÓN ATÓMICA DE ETIQUETAS')
@@ -371,6 +513,16 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
             )
             ids_con_tag_anterior = [fila[0] for fila in cursor]
 
+        # Bloquear y capturar tags previos a cualquier limpieza.
+        # La transacción garantiza que nadie los cambia entre lectura y escritura.
+        with conexion_tags.cursor() as cursor:
+            cursor.execute(
+                """SELECT id, tag FROM public.consumo_agua
+                   WHERE id = ANY(%s) AND NULLIF(BTRIM(tag), '') IS NOT NULL
+                   FOR UPDATE""",
+                (sorted(ids_clasificables),),
+            )
+            tags_anteriores = dict(cursor.fetchall())
         limpiar_tags_ids(sorted(ids_clasificables), conn=conexion_tags)
         actualizador.ejecutar(conn=conexion_tags)
         actualizar_sin_categorizar(ids, conn=conexion_tags)
@@ -381,6 +533,45 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
             resultados_atipicos, registros_db, modelo_atipicos,
             conn=conexion_tags,
         )
+        # Política conservadora: si ninguna regla nueva produjo una etiqueta,
+        # no convertir una etiqueta histórica no vacía en cadena vacía.
+        if tags_anteriores:
+            with conexion_tags.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, tag FROM public.consumo_agua WHERE id = ANY(%s)",
+                    (list(tags_anteriores),),
+                )
+                tags_posteriores = dict(cursor.fetchall())
+                if set(tags_posteriores) != set(tags_anteriores):
+                    raise RuntimeError('Cambió el conjunto de IDs durante la transacción')
+                conservadas = _preservar_tags_previos(
+                    tags_anteriores, tags_posteriores,
+                )
+                if conservadas:
+                    from psycopg2.extras import execute_values
+                    pares = list(conservadas.items())
+                    for ini in range(0, len(pares), 1000):
+                        execute_values(
+                            cursor,
+                            """UPDATE public.consumo_agua AS c
+                               SET tag = v.tag
+                               FROM (VALUES %s) AS v(id, tag)
+                               WHERE c.id = v.id""",
+                            pares[ini:ini + 1000],
+                            page_size=1000,
+                        )
+                cursor.execute(
+                    """SELECT COUNT(*) FROM public.consumo_agua
+                       WHERE id = ANY(%s) AND NULLIF(BTRIM(tag), '') IS NULL""",
+                    (list(tags_anteriores),),
+                )
+                if cursor.fetchone()[0]:
+                    raise RuntimeError('ROLLBACK: etiquetas antiguas quedaron vacías')
+            print(
+                f'[PROTECCIÓN] Conservadas {len(conservadas)} etiquetas previas '
+                'sin nueva clasificación (no se consideran recalculadas).'
+            )
+
         # No permitir que una etiqueta válida desaparezca silenciosamente.
         if ids_con_tag_anterior:
             with conexion_tags.cursor() as cursor:
@@ -404,6 +595,18 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
 
         # __exit__ confirma si no hubo errores; ante error revierte TODO.
     print('[POSTGRES] COMMIT ÚNICO: etiquetas y métricas confirmadas')
+    # Publicar modelo solo después de que PostgreSQL confirme las etiquetas.
+    from tempfile import mkstemp
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_nombre = mkstemp(prefix='.atipico_provisional_', dir=MODEL_PATH.parent)
+    os.close(fd)
+    temporal = Path(temp_nombre)
+    try:
+        modelo_atipicos.guardar(temporal)
+        os.replace(temporal, MODEL_PATH)
+    finally:
+        temporal.unlink(missing_ok=True)
+    print(f'[ENTRENAMIENTO] PKL publicado: {MODEL_PATH}')
     del actualizador, ids
 
     tiempo_total = time.perf_counter() - inicio_total
