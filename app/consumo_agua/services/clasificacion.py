@@ -4,7 +4,7 @@ from ..models.consumo import (
     ConsumoAgua, ConsumoDB, DiaConsumo, es_hora_madrugada, es_medidor_virtual,
 )
 from ..repositories.postgres_repository import ActualizadorTags
-from ..utils.normalizacion import clave_consumo, fecha_solo
+from ..utils.normalizacion import clave_consumo, clave_fila, fecha_solo
 
 
 def agrupar_por_dia(registros: list[ConsumoDB]) -> dict[date, DiaConsumo]:
@@ -161,7 +161,7 @@ def marcar_offline_y_sin_agua(
         consumo_total = ultimo_consumo.consumoTotal
         registros_ultimo_dia = []
         for cons in fechas_dict[ultimo_dia_periodo]:
-            ck = clave_consumo(cons)
+            ck = clave_fila(cons)
             if ck in registros_db:
                 registros_ultimo_dia.append(registros_db[ck])
         if not registros_ultimo_dia:
@@ -198,7 +198,7 @@ def preparar_sin_categorizar(consumos: list[ConsumoAgua], registros_db: dict) ->
         if consumo.tag:
             continue
         consumo.tag = "SIN CATEGORIZAR"
-        registro = registros_db.get(clave_consumo(consumo))
+        registro = registros_db.get(clave_fila(consumo))
         if registro and registro.id:
             ids.append(registro.id)
     return ids

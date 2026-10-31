@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from ..models.consumo import ConsumoAgua, ConsumoDB, es_medidor_virtual
-from ..utils.normalizacion import clave_consumo
+from ..utils.normalizacion import clave_fila
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -1034,7 +1034,7 @@ def aplicar_modelo_atipicos_positivos(
         )
         resultados.append(resultado)
 
-        registro: ConsumoDB | None = registros_db.get(clave_consumo(consumo))
+        registro: ConsumoDB | None = registros_db.get(clave_fila(consumo))
         if not registro or registro.id is None:
             continue
 
