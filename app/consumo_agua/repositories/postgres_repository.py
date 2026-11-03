@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from contextlib import nullcontext
 from collections import Counter, defaultdict
 import math
 import time
@@ -7,7 +8,7 @@ from psycopg2.extras import execute_values
 
 from ...shared.database.databasePostgress import get_connection as get_conn
 from ..models.consumo import ConsumoAgua, ConsumoDB
-from ..utils.normalizacion import clave_consumo, fecha_solo
+from ..utils.normalizacion import clave_consumo, clave_fila, fecha_solo, _decimal_pg, _fecha_pg
 
 BATCH_SIZE = 10000
 NUMERIC_10_2_MAX = 99_999_999.99
@@ -104,89 +105,175 @@ def _conteos_existentes_dia(cursor, dia: date) -> dict:
     }
 
 
-def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
-    """Inserta solo el déficit de filas por clave y conserva IDs reutilizados.
+# Columnas crudas de MSSQL: intencionalmente NO incluyen tags, setpoints
+# ni métricas derivadas. Si cambia una clasificación, se reutiliza el ID.
+_COLUMNAS_ORIGEN = (
+    'cc', '"idVBox"', '"Sucursal"', '"NombreMedidor"', '"Formato"',
+    '"Mercado"', '"Campo"', 'tipo', '"M2"', '"Fecha"',
+    '"consumoTotal"', 'hora', '"ConsumoHora"', '"Cliente"',
+    '"Area"', '"Ciudad"',
+)
 
-    Si MSSQL entrega N filas bajo una misma clave y PostgreSQL ya tiene M,
-    inserta max(0, N-M). Una segunda ejecución no añade nuevas copias.
-    No depura datos antiguos ni sobrescribe mediciones históricas.
+
+def _validar_esquema(cursor) -> None:
+    """Evita cambios parciales cuando falta cc en la base local."""
+    cursor.execute("""
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'consumo_agua'
+              AND column_name = 'cc'
+        )
+    """)
+    if not cursor.fetchone()[0]:
+        raise RuntimeError(
+            "La tabla public.consumo_agua no tiene 'cc'. "
+            "No se insertó nada: aplicar migración autorizada primero."
+        )
+
+
+def _existentes_por_fila_dia(cursor, dia: date) -> dict:
+    """Un ID por fila original distinta, aun si hay millones de copias antiguas.
+
+    Se agrupa por las 16 columnas de origen y NO por tag o setpoint.
+    Por eso una reclasificación no provoca una nueva inserción.
+    """
+    columnas = ', '.join(_COLUMNAS_ORIGEN)
+    cursor.execute(f"""
+        SELECT MAX(id), {columnas}
+        FROM public.consumo_agua
+        WHERE "Fecha" >= %s AND "Fecha" < %s
+        GROUP BY {columnas}
+    """, (dia, dia + timedelta(days=1)))
+    existentes = {}
+    for row in cursor:
+        rid, cc, vbox, sucursal, nombre, formato, mercado, campo, tipo, m2, fecha, total, hora, consumo_hora, cliente, area, ciudad = row
+        firma = (
+            (None if cc is None else int(cc)), int(vbox), sucursal or '', nombre or '',
+            formato or '', mercado or '', campo or '', tipo or '',
+            _decimal_pg(m2), _fecha_pg(fecha), _decimal_pg(total),
+            int(hora), _decimal_pg(consumo_hora), cliente or '',
+            area or '', ciudad or '',
+        )
+        existentes[firma] = int(rid)
+    return existentes
+
+
+def insertar_consumos(consumos: list[ConsumoAgua]) -> dict:
+    """Sincroniza filas crudas distintas y devuelve una referencia POR FILA.
+
+    Se reciben/procesan TODOS los objetos de entrada. Si MSSQL repite una fila
+    idéntica, esa copia comparte ID en PG en vez de generar un duplicado.
+    Distintos consumos o NombreMedidor nunca se sustituyen mutuamente.
     """
     if not consumos:
         return {}
-    print(f"[POSTGRES] Verificando {len(consumos)} registros antes de insertar...")
-    query = '''
-        INSERT INTO public.consumo_agua (
-            cc, "idVBox", "Sucursal", "NombreMedidor", "Formato", "Mercado",
-            "Campo", tipo, "M2", "Fecha", "consumoTotal", hora,
-            "ConsumoHora", tag, categoria, setpoint_agua, "Cliente",
-            "Area", "Ciudad"
-        ) VALUES %s RETURNING id
-    '''
+    print(f"[POSTGRES] Verificando {len(consumos)} filas de MSSQL...")
+    columnas_insert = (
+        'cc, "idVBox", "Sucursal", "NombreMedidor", "Formato", "Mercado", '
+        '"Campo", tipo, "M2", "Fecha", "consumoTotal", hora, '
+        '"ConsumoHora", tag, categoria, setpoint_agua, "Cliente", "Area", "Ciudad"'
+    )
+    query = f'INSERT INTO public.consumo_agua ({columnas_insert}) VALUES %s RETURNING id'
     por_dia = defaultdict(list)
-    for c in consumos:
-        por_dia[fecha_solo(c.Fecha)].append(c)
+    for consumo in consumos:
+        por_dia[fecha_solo(consumo.Fecha)].append(consumo)
 
     resultado = {}
-    insertados = 0
-    reutilizados = 0
+    nuevos = reutilizados = colapsados = 0
     inicio = time.perf_counter()
     with get_conn() as conn:
         with conn.cursor() as cursor:
-            # Serializa ejecuciones de esta versión del programa; no bloquea
-            # otros clientes que escriban directamente en la tabla.
+            # Protección solo entre escritores que usan esta misma función.
             cursor.execute("SELECT pg_advisory_xact_lock(193681, 20261030)")
+            _validar_esquema(cursor)
             for dia, consumos_dia in sorted(por_dia.items()):
-                existentes = _conteos_existentes_dia(cursor, dia)
-                origen = Counter(clave_consumo(c) for c in consumos_dia)
-                candidatos = defaultdict(list)
-                for c in consumos_dia:
-                    candidatos[clave_consumo(c)].append(c)
-
+                existentes = _existentes_por_fila_dia(cursor, dia)
                 pendientes = []
-                for clave, items in candidatos.items():
-                    cantidad_anterior, id_reutilizado = existentes.get(clave, (0, None))
-                    cantidad_nueva = max(0, len(items) - cantidad_anterior)
-                    reutilizados += min(len(items), cantidad_anterior)
-                    if id_reutilizado is not None:
-                        resultado[clave] = ConsumoDB(
-                            id=id_reutilizado, consumo=items[-1]
-                        )
-                    if cantidad_nueva:
-                        pendientes.extend(items[-cantidad_nueva:])
+                vistos = set()
+                for c in consumos_dia:
+                    clave = clave_fila(c)
+                    if clave in vistos:
+                        colapsados += 1
+                        continue
+                    vistos.add(clave)
+                    if clave in existentes:
+                        resultado[clave] = ConsumoDB(id=existentes[clave], consumo=c)
+                        reutilizados += 1
+                    else:
+                        # Si cc se agregó después, las filas históricas podrían
+                        # tener NULL o el valor por defecto 0. Nunca insertar
+                        # silenciosamente otra copia de la misma lectura.
+                        id_legacy = None
+                        for cc_legacy in (None, 0):
+                            legacy = (cc_legacy, *clave[1:])
+                            if legacy != clave and legacy in existentes:
+                                id_legacy = existentes[legacy]
+                                break
+
+                        if id_legacy is not None:
+                            resultado[clave] = ConsumoDB(
+                                id=id_legacy, consumo=c
+                            )
+                            reutilizados += 1
+                        else:
+                            # Excepción verificada: cambio de área en MSSQL.
+                            # No modificar el registro histórico ni insertar copia.
+                            if (
+                                int(c.idVBox) == 7369
+                                and date(2026, 9, 1) <= fecha_solo(c.Fecha) <= date(2026, 9, 3)
+                                and str(c.Area or '').strip() == 'Demasías'
+                            ):
+                                candidatos = [
+                                    existentes[k]
+                                    for cc_anterior in (None, 0)
+                                    for k in [(
+                                        cc_anterior,
+                                        *clave[1:14],
+                                        'Agua principal',
+                                        clave[15],
+                                    )]
+                                    if k in existentes
+                                ]
+                                if len(set(candidatos)) != 1:
+                                    raise RuntimeError(
+                                        'Equipo 7369: no existe una '
+                                        'coincidencia histórica única. '
+                                        'Sincronización cancelada.'
+                                    )
+                                resultado[clave] = ConsumoDB(
+                                    id=candidatos[0], consumo=c
+                                )
+                                reutilizados += 1
+                            else:
+                                pendientes.append(c)
 
                 for posicion in range(0, len(pendientes), BATCH_SIZE):
-                    lote = pendientes[posicion: posicion + BATCH_SIZE]
+                    lote = pendientes[posicion:posicion + BATCH_SIZE]
                     valores = [(
-                        c.cc, c.idVBox, c.Sucursal, c.NombreMedidor, c.Formato,
-                        c.Mercado, c.Campo, c.tipo,
-                        valor_numeric_postgres(c.M2, "M2", NUMERIC_10_2_MAX),
+                        c.cc, c.idVBox, c.Sucursal, c.NombreMedidor,
+                        c.Formato, c.Mercado, c.Campo, c.tipo,
+                        valor_numeric_postgres(c.M2, 'M2', NUMERIC_10_2_MAX),
                         c.Fecha,
-                        valor_numeric_postgres(c.consumoTotal, "consumoTotal", NUMERIC_20_2_MAX),
+                        valor_numeric_postgres(c.consumoTotal, 'consumoTotal', NUMERIC_20_2_MAX),
                         c.hora,
-                        valor_numeric_postgres(c.ConsumoHora, "ConsumoHora", NUMERIC_20_2_MAX),
-                        c.tag or "", c.categoria or "",
-                        valor_numeric_postgres(c.setpoint_agua, "setpoint_agua", NUMERIC_20_2_MAX),
+                        valor_numeric_postgres(c.ConsumoHora, 'ConsumoHora', NUMERIC_20_2_MAX),
+                        c.tag or '', c.categoria or '',
+                        valor_numeric_postgres(c.setpoint_agua, 'setpoint_agua', NUMERIC_20_2_MAX),
                         c.Cliente, c.Area, c.Ciudad,
                     ) for c in lote]
                     rows = execute_values(cursor, query, valores,
                                           page_size=BATCH_SIZE, fetch=True)
                     if len(rows) != len(lote):
-                        raise RuntimeError(
-                            f"INSERT inconsistente: {len(lote)} enviados / {len(rows)} IDs"
-                        )
-                    for consumo, row in zip(lote, rows):
-                        clave = clave_consumo(consumo)
-                        nuevo = ConsumoDB(id=row[0], consumo=consumo)
-                        resultado[clave] = seleccionar_registro_representativo(
-                            resultado.get(clave), nuevo
-                        )
-                    insertados += len(lote)
-                print(f"[POSTGRES {dia}] origen={len(consumos_dia)} "
-                      f"nuevos={len(pendientes)} claves={len(origen)}")
+                        raise RuntimeError(f'INSERT inconsistente: {len(lote)} filas / {len(rows)} IDs')
+                    for c, (id_nuevo,) in zip(lote, rows):
+                        resultado[clave_fila(c)] = ConsumoDB(id=id_nuevo, consumo=c)
+                    nuevos += len(lote)
+                print(f'[POSTGRES {dia}] recibidos={len(consumos_dia)} '
+                      f'únicos={len(vistos)} nuevos={len(pendientes)}')
         conn.commit()
-    print(f"[POSTGRES] Nuevas filas: {insertados}; "
-          f"filas cubiertas por existentes: {reutilizados} "
-          f"({time.perf_counter() - inicio:.2f}s)")
+    print(f'[POSTGRES] Insertados: {nuevos}; reutilizados: {reutilizados}; '
+          f'copias idénticas en origen: {colapsados} '
+          f'({time.perf_counter() - inicio:.2f}s)')
     return resultado
 
 
@@ -346,7 +433,7 @@ class ActualizadorTags:
     def cantidad(self) -> int:
         return len(self.actualizaciones)
 
-    def ejecutar(self):
+    def ejecutar(self, conn=None):
         if not self.actualizaciones:
             return
         valores = list(self.actualizaciones.items())
@@ -358,18 +445,19 @@ class ActualizadorTags:
             WHERE c.id = v.id
         '''
         inicio = time.perf_counter()
-        with get_conn() as conn:
-            with conn.cursor() as cursor:
+        with (nullcontext(conn) if conn is not None else get_conn()) as conexion:
+            with conexion.cursor() as cursor:
                 for posicion in range(0, len(valores), BATCH_SIZE):
                     lote = valores[posicion: posicion + BATCH_SIZE]
                     execute_values(cursor, query, lote, page_size=BATCH_SIZE)
-            conn.commit()
+            if conn is None:
+                conexion.commit()
         segundos = time.perf_counter() - inicio
         print(f"[POSTGRES] Tags actualizados: {len(valores)} ({segundos:.2f}s)")
         self.actualizaciones.clear()
 
 
-def actualizar_sin_categorizar(ids: list[int]) -> None:
+def actualizar_sin_categorizar(ids: list[int], conn=None) -> None:
     if not ids:
         return
     query = '''
@@ -377,11 +465,34 @@ def actualizar_sin_categorizar(ids: list[int]) -> None:
         SET tag = 'SIN CATEGORIZAR'
         WHERE id = ANY(%s)
     '''
-    with get_conn() as conn:
-        with conn.cursor() as cursor:
+    with (nullcontext(conn) if conn is not None else get_conn()) as conexion:
+        with conexion.cursor() as cursor:
             cursor.execute(query, (ids,))
-        conn.commit()
+        if conn is None:
+            conexion.commit()
     print(f"[POSTGRES] {len(ids)} registros -> SIN CATEGORIZAR")
+
+def limpiar_tags_ids(ids: list[int], conn=None) -> None:
+    """Reinicia SOLO filas presentes en la extracción, nunca todo el histórico."""
+    if not ids:
+        return
+    query = '''
+        UPDATE public.consumo_agua
+        SET tag = CASE
+            WHEN "consumoTotal" = -1 THEN 'MEDIDOR OFFLINE'
+            WHEN "consumoTotal" = 0 THEN 'ATÍPICO'
+            ELSE ''
+        END
+        WHERE id = ANY(%s)
+    '''
+    with (nullcontext(conn) if conn is not None else get_conn()) as conexion:
+        with conexion.cursor() as cursor:
+            cursor.execute(query, (list(set(ids)),))
+            cantidad = cursor.rowcount
+        if conn is None:
+            conexion.commit()
+    print(f'[POSTGRES] Tags reiniciados solo para {cantidad} IDs recibidos')
+
 
 def limpiar_tags_periodo(fecha_inicio, fecha_fin) -> None:
     query = '''

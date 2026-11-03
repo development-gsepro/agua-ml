@@ -80,7 +80,8 @@ class DiaConsumo:
 
     @property
     def supera_sp(self) -> bool:
-        return self.consumo_total > self.set_point
+        # Un umbral faltante o nulo NO es evidencia de consumo elevado.
+        return self.set_point > 0 and self.consumo_total > self.set_point
 
     @property
     def tiene_consumo_horario(self) -> bool:

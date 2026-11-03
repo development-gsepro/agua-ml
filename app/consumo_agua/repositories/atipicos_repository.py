@@ -1,12 +1,14 @@
 import time
+from contextlib import nullcontext
 
 from psycopg2.extras import execute_values
 from ...shared.database.databasePostgress import get_connection as get_conn
-from ..utils.normalizacion import clave_consumo
+from ..utils.normalizacion import clave_fila
 
 def actualizar_tags_atipicos_positivos(
     tags_positivos: dict[int, str],
     ids_vacios: list[int],
+    conn=None,
 ) -> None:
     if not tags_positivos and not ids_vacios:
         return
@@ -17,8 +19,8 @@ def actualizar_tags_atipicos_positivos(
     # ningún positivo puede limpiarse posteriormente.
     ids_vacios = sorted(set(ids_vacios) - positivos)
 
-    with get_conn() as conn:
-        with conn.cursor() as cursor:
+    with (nullcontext(conn) if conn is not None else get_conn()) as conexion:
+        with conexion.cursor() as cursor:
             for tag in (
                 "ATÍPICO POSITIVO DÍA",
             ):
@@ -48,13 +50,15 @@ def actualizar_tags_atipicos_positivos(
                     (ids_vacios,),
                 )
 
-        conn.commit()
+        if conn is None:
+            conexion.commit()
 
 def actualizar_metricas_atipicos(
     resultados,
     registros_db: dict,
     modelo,
     batch_size: int = 5000,
+    conn=None,
 ) -> None:
     """
     Guarda por lotes las métricas calculadas por el modelo:
@@ -73,7 +77,7 @@ def actualizar_metricas_atipicos(
         consumo = resultado.consumo
 
         registro = registros_db.get(
-            clave_consumo(consumo)
+            clave_fila(consumo)
         )
 
         if registro is None or registro.id is None:
@@ -157,8 +161,8 @@ def actualizar_metricas_atipicos(
 
     actualizados = 0
 
-    with get_conn() as conn:
-        with conn.cursor() as cursor:
+    with (nullcontext(conn) if conn is not None else get_conn()) as conexion:
+        with conexion.cursor() as cursor:
 
             for inicio_lote in range(
                 0,
@@ -178,7 +182,8 @@ def actualizar_metricas_atipicos(
                     page_size=batch_size,
                 )
 
-                conn.commit()
+                if conn is None:
+                    conexion.commit()
 
                 actualizados += len(lote)
 

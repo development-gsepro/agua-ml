@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from ..models.consumo import ConsumoAgua, ConsumoDB, es_medidor_virtual
-from ..utils.normalizacion import clave_consumo
+from ..utils.normalizacion import clave_fila
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
@@ -160,10 +160,15 @@ class ModeloAtipicosPositivos:
 
     @staticmethod
     def _estadisticas(valores: np.ndarray) -> tuple[float, float, float, float, float]:
+        valores = np.asarray(valores, dtype=np.float64).ravel()
         valores = valores[np.isfinite(valores)]
+        if valores.size == 0:
+            raise ValueError("No hay valores válidos para calcular estadísticas")
         mediana = float(np.median(valores))
-        q1 = float(np.quantile(valores, PERCENTIL_Q1))
-        q3 = float(np.quantile(valores, PERCENTIL_Q3))
+        q1, q3 = map(
+            float,
+            np.quantile(valores, [PERCENTIL_Q1, PERCENTIL_Q3])
+        )
         iqr = q3 - q1
         mad = float(np.median(np.abs(valores - mediana)))
         sigma_robusta = FACTOR_ESCALA_MAD * mad
@@ -1034,7 +1039,7 @@ def aplicar_modelo_atipicos_positivos(
         )
         resultados.append(resultado)
 
-        registro: ConsumoDB | None = registros_db.get(clave_consumo(consumo))
+        registro: ConsumoDB | None = registros_db.get(clave_fila(consumo))
         if not registro or registro.id is None:
             continue
 
