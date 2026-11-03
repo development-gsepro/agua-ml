@@ -1,4 +1,6 @@
+from datetime import datetime, timedelta
 from app.consumo_agua.consumo_agua import clasificador
 
+ayer = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
-clasificador('2026-10-29', '2026-10-29')
+clasificador(ayer, ayer)
