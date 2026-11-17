@@ -45,7 +45,7 @@ from .services.atipicos_positivos import (
 )
 from .utils.normalizacion import clave_consumo, clave_fila, clave_medidor, fecha_solo
 
-DIAS_HISTORICO = 10
+DIAS_HISTORICO = 1
 
 
 def _filas_existentes_simulacion(consumos: list[ConsumoAgua]) -> dict:
@@ -269,7 +269,7 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     setpoints = cargar_setpoints()
 
     print("\n[1/7] OBTENIENDO CONSUMOS (PARQUET / MSSQL)")
-    consumos = ejecutar_por_dia(fec_ini, fec_fin, consumoTotalHora)
+    consumos = obtener_consumos_con_cache(fec_ini, fec_fin, consumoTotalHora)
     if not consumos:
         print("[ERROR] MSSQL no devolvió datos.")
         return []
@@ -282,7 +282,6 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     consumos_clasificables, grupos_protegidos = separar_medidores_protegidos(consumos)
     print(f'[PROTECCIÓN TAGS] Medidores protegidos: {len(grupos_protegidos)}; '
           f'filas sin reclasificar: {len(consumos) - len(consumos_clasificables)}')
-
     print("\n[ENTRENAMIENTO] ENTRENANDO IA DE ATÍPICOS POSITIVOS")
     df_entrenamiento = leer_historico()
     if df_entrenamiento.empty:
@@ -320,6 +319,8 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     print(f"[2/7] ATÍPICO: {atipicos}")
     print(f"[2/7] Históricos (para clasificación): {len(historicos)}")
 
+    input("Presione ENTER para continuar | Insertar Postgresql...")
+
     print("\n[3/7] INSERTANDO EN POSTGRESQL")
     registros_db = (
         _filas_existentes_simulacion(consumos)
@@ -344,6 +345,7 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
 
     actualizador = ActualizadorTags()
     if claves_medidores:
+        input("Presione ENTER para continuar | Cargar historico...")
         print("\n[5/7] CARGANDO HISTÓRICO")
         fecha_inicio = datetime.strptime(fec_ini, "%Y-%m-%d").date()
         fecha_fin = datetime.strptime(fec_fin, "%Y-%m-%d").date()
@@ -423,6 +425,7 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     gc.collect()
     print("[MEMORIA] Estructuras del clasificador normal liberadas.")
 
+    input("Presione ENTER para continuar | Evaluar atípicos...")
     print("\n[7/7] EVALUANDO ATÍPICOS POSITIVOS")
     tags_positivos, ids_vacios, resultados_atipicos = (
         aplicar_modelo_atipicos_positivos(
@@ -431,12 +434,12 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     )
     print("[ATÍPICO POSITIVO] Etiquetas y métricas calculadas (sin escribir todavía)")
     con_perfil = sum(r.tiene_perfil for r in resultados_atipicos)
-    diarios = sum(r.atipico_diario for r in resultados_atipicos)
-    horarios = sum(r.atipico_horario for r in resultados_atipicos)
-    ambos = sum(
-        r.atipico_diario and r.atipico_horario
-        for r in resultados_atipicos
-    )
+    # diarios = sum(r.atipico_diario for r in resultados_atipicos)
+    # horarios = sum(r.atipico_horario for r in resultados_atipicos)
+    # ambos = sum(
+    #     r.atipico_diario and r.atipico_horario
+    #     for r in resultados_atipicos
+    # )
     print(
         f"[ATÍPICO POSITIVO] Candidatos: {len(resultados_atipicos)} | "
         f"con perfil: {con_perfil} | positivos únicos: {len(tags_positivos)} | "
@@ -655,4 +658,3 @@ def clasificador(fec_ini: str, fec_fin: str) -> list[ConsumoAgua]:
     print(f"Tiempo total: {tiempo_total:.2f} segundos")
     print("#" * 70)
     return consumos
-

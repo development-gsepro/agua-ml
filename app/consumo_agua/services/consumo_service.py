@@ -301,6 +301,7 @@ def verificar_sincronizacion(consumos_recibidos: list[ConsumoAgua], registros_db
 
     faltan_ids = set(ids) - encontrados
     print('\n' + '=' * 65)
+    input(f'Presione ENTER para continuar | Verificación de sincronización...')
     print('VERIFICACIÓN REAL — MSSQL / IDs FÍSICOS EN POSTGRESQL')
     print('=' * 65)
     print(f'Filas distintas de origen: {len(origen)}')

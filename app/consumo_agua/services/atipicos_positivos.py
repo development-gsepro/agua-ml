@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from ..models.consumo import ConsumoAgua, ConsumoDB, es_medidor_virtual
-from ..utils.normalizacion import clave_fila
+from ..utils.normalizacion import clave_fila, clave_consumo
 
 
 ROOT_DIR = Path(__file__).resolve().parents[3]
