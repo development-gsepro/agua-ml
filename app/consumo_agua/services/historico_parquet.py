@@ -17,7 +17,7 @@ PARQUET_PATH = DATA_DIR / "consumo_agua_historico.parquet"
 META_PATH = DATA_DIR / "consumo_agua_historico.meta.json"
 
 COLUMNAS_CONSUMO = [
-    "idVBox", "Sucursal", "Cliente", "Area", "NombreMedidor", "Ciudad",
+    "cc","idVBox", "Sucursal", "Cliente", "Area", "NombreMedidor", "Ciudad",
     "Formato", "Mercado", "Campo", "tipo", "M2", "Fecha",
     "consumoTotal", "hora", "ConsumoHora", "tag", "categoria", "motivo",
     "setPointSemana", "setPointFinSemana", "setpoint_agua",
@@ -60,18 +60,25 @@ def _consumos_a_dataframe(consumos: Iterable[ConsumoAgua]) -> pd.DataFrame:
     return df
 
 
+
 def _dataframe_a_consumos(df: pd.DataFrame) -> list[ConsumoAgua]:
     if df.empty:
         return []
+
     resultado: list[ConsumoAgua] = []
+
     for fila in df.to_dict(orient="records"):
         fecha = fila.get("Fecha")
+
         if pd.isna(fecha):
             continue
+
         if hasattr(fecha, "to_pydatetime"):
             fecha = fecha.to_pydatetime()
+
         resultado.append(
             ConsumoAgua(
+                cc=int(fila.get("cc") or 0),
                 idVBox=int(fila.get("idVBox") or 0),
                 Sucursal=str(fila.get("Sucursal") or ""),
                 Cliente=str(fila.get("Cliente") or ""),
@@ -95,8 +102,8 @@ def _dataframe_a_consumos(df: pd.DataFrame) -> list[ConsumoAgua]:
                 setpoint_agua=float(fila.get("setpoint_agua") or 0),
             )
         )
-    return resultado
 
+    return resultado
 
 def leer_historico() -> pd.DataFrame:
     if not PARQUET_PATH.exists():

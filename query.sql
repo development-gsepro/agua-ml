@@ -22,7 +22,7 @@ SELECT
 FROM 
 	public.consumo_agua
 WHERE 
-	"Fecha" > '2026-09-06'
+	"Fecha" > '2026-09-22'
 ORDER BY
 	id, 
 	"idVBox", 

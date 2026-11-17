@@ -4,7 +4,7 @@ from ..models.consumo import (
     ConsumoAgua, ConsumoDB, DiaConsumo, es_hora_madrugada, es_medidor_virtual,
 )
 from ..repositories.postgres_repository import ActualizadorTags
-from ..utils.normalizacion import clave_consumo, fecha_solo
+from ..utils.normalizacion import clave_consumo, clave_fila, fecha_solo
 
 
 def agrupar_por_dia(registros: list[ConsumoDB]) -> dict[date, DiaConsumo]:
@@ -24,7 +24,7 @@ def evaluar_consumo_elevado(dias: dict[date, DiaConsumo], actualizador: Actualiz
     for fecha_actual in fechas:
         inicio = fecha_actual - timedelta(days=6)
         ventana = [dias[f] for f in fechas if inicio <= f <= fecha_actual]
-        if len(ventana) < 7:
+        if len(ventana) < 7 or any(dia.set_point <= 0 for dia in ventana):
             continue
         if sum(dia.supera_sp for dia in ventana) > 3:
             registros = []
@@ -73,31 +73,62 @@ def evaluar_fugas(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
         )
         actualizador.agregar(dia_bandera.registros, tag)
 
-def evaluar_fuga_reparada(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
+def evaluar_fuga_reparada(
+    dias: dict[date, DiaConsumo],
+    actualizador: ActualizadorTags
+):
     """Marca FUGA REPARADA al cuarto día consecutivo debajo del SP.
 
-    El día inmediatamente anterior a esos cuatro días debe ser el último día
-    que superó el SP. La etiqueta se aplica únicamente al cuarto día posterior.
+    El día inmediatamente anterior a esos cuatro días debe ser un día
+    que superó o igualó el SP.
+
+    Un consumo igual al SP NO se considera debajo del SP.
     """
+
     fechas = sorted(dias)
+
     for i in range(4, len(fechas)):
-        fecha_ultima_fuga = fechas[i - 4]
+        fecha_anterior = fechas[i - 4]
         posteriores = fechas[i - 3:i + 1]
 
+        # También el día de antecedente debe ser inmediatamente anterior.
+        # No fabricar una racha si falta un día entre el antecedente y la reparación.
+        if fecha_anterior + timedelta(days=1) != posteriores[0]:
+            continue
+
+        # Los cuatro días deben ser consecutivos
         if not all(
-            posteriores[j] == fecha_ultima_fuga + timedelta(days=j + 1)
+            posteriores[j] == fecha_anterior + timedelta(days=j + 1)
             for j in range(4)
         ):
             continue
-        if not dias[fecha_ultima_fuga].supera_sp:
+
+        # El día anterior debe haber cumplido o superado el SP
+        if not dias[fecha_anterior].supera_sp:
             continue
 
         ventana_reparacion = [dias[f] for f in posteriores]
-        if any(dia.supera_sp for dia in ventana_reparacion):
+
+        # Sin SP válido en alguno de los cinco días no puede afirmarse reparación.
+        if dias[fecha_anterior].set_point <= 0 or any(
+            dia.set_point <= 0 for dia in ventana_reparacion
+        ):
             continue
 
-        actualizador.agregar(ventana_reparacion[-1].registros, "FUGA REPARADA")
+        if any(dia.consumo_total <= 0 for dia in ventana_reparacion):
+            continue
 
+        # Deben estar ESTRICTAMENTE bajo el SP. Un consumo igual
+        # al SP no demuestra que la fuga esté reparada.
+        if any(dia.consumo_total >= dia.set_point for dia in ventana_reparacion):
+            continue
+
+        # La etiqueta solamente se aplica al cuarto día
+        actualizador.agregar(
+            ventana_reparacion[-1].registros,
+            "FUGA REPARADA"
+        )
+        
 def evaluar_consumo_madrugada(dias: dict[date, DiaConsumo], actualizador: ActualizadorTags):
     """Detecta consumo de madrugada sin etiquetar registros fuera de la ventana.
 
@@ -106,7 +137,7 @@ def evaluar_consumo_madrugada(dias: dict[date, DiaConsumo], actualizador: Actual
     """
     for dia in dias.values():
         total = dia.consumo_total
-        if total <= 0 or dia.supera_sp:
+        if total <= 0 or dia.set_point <= 0 or dia.supera_sp:
             continue
 
         registros_madrugada = [
@@ -141,7 +172,7 @@ def marcar_offline_y_sin_agua(
         consumo_total = ultimo_consumo.consumoTotal
         registros_ultimo_dia = []
         for cons in fechas_dict[ultimo_dia_periodo]:
-            ck = clave_consumo(cons)
+            ck = clave_fila(cons)
             if ck in registros_db:
                 registros_ultimo_dia.append(registros_db[ck])
         if not registros_ultimo_dia:
@@ -178,7 +209,7 @@ def preparar_sin_categorizar(consumos: list[ConsumoAgua], registros_db: dict) ->
         if consumo.tag:
             continue
         consumo.tag = "SIN CATEGORIZAR"
-        registro = registros_db.get(clave_consumo(consumo))
+        registro = registros_db.get(clave_fila(consumo))
         if registro and registro.id:
             ids.append(registro.id)
     return ids
